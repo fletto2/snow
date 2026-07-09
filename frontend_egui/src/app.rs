@@ -327,6 +327,7 @@ impl SnowGui {
         serial_bridge_a: Option<&str>,
         serial_bridge_b: Option<&str>,
         floppies: &[String],
+        forced_model: Option<MacModel>,
     ) -> Self {
         egui_material_icons::initialize(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(zoom_factor);
@@ -501,17 +502,15 @@ impl SnowGui {
 
         if let Some(filename) = initial_file {
             let path = Path::new(&filename);
-            if path
-                .extension()
-                .unwrap_or_default()
-                .eq_ignore_ascii_case("snoww")
-            {
+            let ext = path.extension().unwrap_or_default();
+            if ext.eq_ignore_ascii_case("snoww") {
                 app.load_workspace(Some(path));
-            } else if path
-                .extension()
-                .unwrap_or_default()
-                .eq_ignore_ascii_case("rom")
+            } else if ext.eq_ignore_ascii_case("rom")
+                || ext.eq_ignore_ascii_case("bin")
+                || forced_model.is_some()
             {
+                // A forced model bypasses ROM-hash auto-detection, so custom
+                // ROMs (e.g. macmon's *.bin) can be loaded as any machine.
                 app.load_rom_from_path(
                     path,
                     None,
@@ -519,7 +518,7 @@ impl SnowGui {
                     None,
                     None,
                     &EmulatorInitArgs::default(),
-                    None,
+                    forced_model,
                 );
             }
             if fullscreen {

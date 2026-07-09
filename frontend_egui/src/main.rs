@@ -34,6 +34,7 @@ mod built_info {
 use crate::app::SnowGui;
 
 use clap::Parser;
+use snow_core::mac::MacModel;
 use eframe::egui;
 use egui_winit::winit::{self, application::ApplicationHandler};
 use log::LevelFilter;
@@ -76,6 +77,37 @@ struct Args {
     /// Floppy image(s) to load at start (can be specified multiple times)
     #[arg(long)]
     floppy: Vec<String>,
+
+    /// Force the machine model instead of detecting it from the ROM hash.
+    /// Useful for custom/unknown ROMs. Accepts (case-insensitive):
+    /// 128k, 512k, 512ke, plus, se, sefdhd, classic, ii, iifdhd, iix, iicx, se30.
+    #[arg(long, value_name = "MODEL", value_parser = parse_model)]
+    model: Option<MacModel>,
+}
+
+/// Parse a friendly model name into a MacModel.
+fn parse_model(s: &str) -> Result<MacModel, String> {
+    let m = match s.to_ascii_lowercase().replace(['-', '_', ' ', '/'], "").as_str() {
+        "128k" | "mac128k" | "early128k" => MacModel::Early128K,
+        "512k" | "mac512k" | "early512k" => MacModel::Early512K,
+        "512ke" | "mac512ke" | "early512ke" => MacModel::Early512Ke,
+        "plus" | "macplus" => MacModel::Plus,
+        "se" | "macse" => MacModel::SE,
+        "sefdhd" | "macsefdhd" => MacModel::SeFdhd,
+        "classic" | "macclassic" => MacModel::Classic,
+        "ii" | "macii" => MacModel::MacII,
+        "iifdhd" | "maciifdhd" => MacModel::MacIIFDHD,
+        "iix" | "maciix" => MacModel::MacIIx,
+        "iicx" | "maciicx" => MacModel::MacIIcx,
+        "se30" | "macse30" => MacModel::SE30,
+        other => {
+            return Err(format!(
+                "unknown model '{}' (try: 128k, 512k, 512ke, plus, se, sefdhd, classic, ii, iifdhd, iix, iicx, se30)",
+                other
+            ))
+        }
+    };
+    Ok(m)
 }
 
 fn main() -> eframe::Result {
@@ -145,6 +177,7 @@ fn main() -> eframe::Result {
                     args.serial_bridge_a.as_deref(),
                     args.serial_bridge_b.as_deref(),
                     &args.floppy,
+                    args.model,
                 )))
             }
         }),
