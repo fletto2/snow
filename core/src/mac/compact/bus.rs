@@ -644,8 +644,14 @@ where
             self.write_normal(addr, val)
         };
 
-        if self.overlay && self.model <= MacModel::Plus && !self.via.a_out.overlay() {
-            self.overlay = false;
+        // On the 512K/Plus, PA4 is a LIVE ROM-overlay mux: overlay is ON while
+        // PA4=1 and OFF while PA4=0, and it must follow PA4 in BOTH directions
+        // (not a one-shot disable).  Software relies on this: e.g. a diagnostic
+        // ROM's machine-type probe drives PA4=1 to check whether ROM re-maps to
+        // $0 (Plus) vs stays RAM (SE, where PA4 is drive-select), then restores
+        // PA4=0.  A one-way disable made the Plus look like an SE to that probe.
+        if self.model <= MacModel::Plus {
+            self.overlay = self.via.a_out.overlay();
         }
 
         // Sync values that live in multiple places
