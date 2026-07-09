@@ -83,6 +83,27 @@ struct Args {
     /// 128k, 512k, 512ke, plus, se, sefdhd, classic, ii, iifdhd, iix, iicx, se30.
     #[arg(long, value_name = "MODEL", value_parser = parse_model)]
     model: Option<MacModel>,
+
+    /// Attach a SCSI hard-disk image at start. Form "[ID:]PATH" (ID 0-6,
+    /// default 0). Repeatable for multiple disks. e.g. --hdd 0:/tmp/posinix.img
+    #[arg(long, value_name = "[ID:]PATH", value_parser = parse_hdd)]
+    hdd: Vec<(usize, String)>,
+}
+
+/// Parse "[ID:]PATH" into (scsi_id, path).  A leading "N:" (N in 0..=6) sets
+/// the SCSI ID; otherwise the whole string is the path and the ID defaults to 0.
+fn parse_hdd(s: &str) -> Result<(usize, String), String> {
+    if let Some((id, path)) = s.split_once(':') {
+        if let Ok(n) = id.parse::<usize>() {
+            if n <= 6 && !path.is_empty() {
+                return Ok((n, path.to_string()));
+            }
+            if n > 6 {
+                return Err(format!("SCSI ID {} out of range (0-6)", n));
+            }
+        }
+    }
+    Ok((0, s.to_string()))
 }
 
 /// Parse a friendly model name into a MacModel.
@@ -178,6 +199,7 @@ fn main() -> eframe::Result {
                     args.serial_bridge_b.as_deref(),
                     &args.floppy,
                     args.model,
+                    &args.hdd,
                 )))
             }
         }),

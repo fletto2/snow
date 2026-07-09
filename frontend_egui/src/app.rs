@@ -4,7 +4,7 @@ use crate::dialogs::diskimage::{DiskImageDialog, DiskImageDialogResult};
 use crate::dialogs::filedialog::SnowFileDialog;
 use crate::dialogs::modelselect::{ModelSelectionDialog, ModelSelectionResult};
 use crate::emulator::EmulatorState;
-use crate::emulator::{EmulatorInitArgs, ScsiTargets};
+use crate::emulator::{EmulatorInitArgs, ScsiTarget, ScsiTargets};
 use crate::keymap::{char_to_keystroke, map_winit_keycode};
 use crate::settings::{AppSettings, CmdKeyMapping, PromptChoice};
 use crate::uniform::{UNIFORM_ACTION, UniformAction};
@@ -328,6 +328,7 @@ impl SnowGui {
         serial_bridge_b: Option<&str>,
         floppies: &[String],
         forced_model: Option<MacModel>,
+        hdds: &[(usize, String)],
     ) -> Self {
         egui_material_icons::initialize(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(zoom_factor);
@@ -500,6 +501,23 @@ impl SnowGui {
             type_clipboard_delay: 0,
         };
 
+        // Build a SCSI target table from any --hdd disks given on the CLI.
+        let cli_scsi_targets: Option<ScsiTargets> = if hdds.is_empty() {
+            None
+        } else {
+            let mut targets: ScsiTargets = std::array::from_fn(|_| ScsiTarget {
+                target_type: None,
+                image_path: None,
+            });
+            for (id, disk_path) in hdds {
+                targets[*id] = ScsiTarget {
+                    target_type: Some(snow_core::mac::scsi::target::ScsiTargetType::Disk),
+                    image_path: Some(PathBuf::from(disk_path)),
+                };
+            }
+            Some(targets)
+        };
+
         if let Some(filename) = initial_file {
             let path = Path::new(&filename);
             let ext = path.extension().unwrap_or_default();
@@ -515,7 +533,7 @@ impl SnowGui {
                     path,
                     None,
                     None,
-                    None,
+                    cli_scsi_targets,
                     None,
                     &EmulatorInitArgs::default(),
                     forced_model,
