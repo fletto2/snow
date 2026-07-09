@@ -142,6 +142,22 @@ bitfield! {
 }
 
 bitfield! {
+    /// SCC write register 4
+    /// Transmit/Receive miscellaneous parameters and modes (async: clock rate,
+    /// stop bits, parity)
+    #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct WrReg4(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
+        pub parity_enable: bool @ 0,
+        pub parity_even: bool @ 1,
+        /// Stop bits: 0=sync, 1=1 bit, 2=1.5 bits, 3=2 bits
+        pub stop_bits: u8 @ 2..=3,
+        pub sync_mode: u8 @ 4..=5,
+        /// Clock rate: 0=x1, 1=x16, 2=x32, 3=x64
+        pub clock_rate: u8 @ 6..=7,
+    }
+}
+
+bitfield! {
     /// SCC write register 5
     /// Transmit parameters and controls
     #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +252,19 @@ struct SccChannel {
     dcd_ie: bool,
 
     reg15: u8,
+
+    /// WR4: clock rate, stop bits, parity (async mode configuration)
+    wr4: u8,
+    /// WR10: miscellaneous transmit/receive control bits
+    wr10: u8,
+    /// WR11: clock mode control (RxC/TxC/TRxC source select)
+    wr11: u8,
+    /// WR12: baud-rate generator time constant, low byte
+    wr12: u8,
+    /// WR13: baud-rate generator time constant, high byte
+    wr13: u8,
+    /// WR14: DPLL / baud-rate generator control
+    wr14: u8,
 
     tx_queue: VecDeque<u8>,
     rx_queue: VecDeque<u8>,
@@ -487,6 +516,8 @@ impl Scc {
                 // Misc. status bits
                 0
             }
+            (12, _) => self.ch[chi].wr12,
+            (13, _) => self.ch[chi].wr13,
             (15, _) => self.ch[chi].reg15,
             _ => {
                 warn!("Ch {:?} unimplemented ctrl read {}", ch, self.reg);
@@ -619,6 +650,11 @@ impl Scc {
                     self.ch[chi].lt_tx_frame.clear();
                 }
             }
+            4 => {
+                // WR4: async clock rate, stop bits, parity
+                self.ch[chi].wr4 = val;
+                self.log_serial_config(ch);
+            }
             6 => {
                 // WR6: SDLC station address - used for LocalTalk node address
                 self.ch[chi].sdlc_address = val;
@@ -626,8 +662,26 @@ impl Scc {
             9 => {
                 self.mic.0 = val;
             }
+            10 => {
+                // WR10: misc TX/RX control (NRZ/NRZI, sync-mode framing)
+                self.ch[chi].wr10 = val;
+            }
+            11 => {
+                // WR11: clock mode control (RxC/TxC/TRxC source select)
+                self.ch[chi].wr11 = val;
+            }
+            12 => {
+                // WR12: baud-rate generator time constant, low byte
+                self.ch[chi].wr12 = val;
+            }
+            13 => {
+                // WR13: baud-rate generator time constant, high byte
+                self.ch[chi].wr13 = val;
+                self.log_serial_config(ch);
+            }
             14 => {
-                // DPLL/baudrate generator
+                // WR14: DPLL / baud-rate generator control
+                self.ch[chi].wr14 = val;
             }
             15 => {
                 // WR15 controls external/status interrupt enables
@@ -641,6 +695,43 @@ impl Scc {
                 warn!("{:?} unimplemented wr reg {} {:02X}", ch, reg, val);
             }
         }
+    }
+
+    /// Compute and log the async serial configuration for a channel from its
+    /// WR4 (clock rate / stop bits / parity) and WR12/WR13 (BRG time constant).
+    /// The Mac feeds the SCC baud-rate generator from a 3.672 MHz PCLK.
+    fn log_serial_config(&self, ch: SccCh) {
+        const SCC_PCLK: u32 = 3_672_000;
+        let c = &self.ch[ch.to_usize().unwrap()];
+        let wr4 = WrReg4(c.wr4);
+        // Sync mode (stop_bits == 0) has no async baud rate to report.
+        if wr4.stop_bits() == 0 {
+            return;
+        }
+        let divisor = match wr4.clock_rate() {
+            0 => 1u32, // x1
+            1 => 16,   // x16
+            2 => 32,   // x32
+            _ => 64,   // x64
+        };
+        let tc = ((c.wr13 as u32) << 8) | (c.wr12 as u32);
+        let baud = SCC_PCLK / (2 * (tc + 2)) / divisor;
+        let stop = match wr4.stop_bits() {
+            2 => "1.5",
+            3 => "2",
+            _ => "1",
+        };
+        let parity = if !wr4.parity_enable() {
+            'N'
+        } else if wr4.parity_even() {
+            'E'
+        } else {
+            'O'
+        };
+        debug!(
+            "SCC {:?}: async ~{} baud (TC={}, x{} clk), 8{}{} stop",
+            ch, baud, tc, divisor, parity, stop
+        );
     }
 
     pub fn get_irq(&mut self) -> bool {
