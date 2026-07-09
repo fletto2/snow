@@ -825,6 +825,19 @@ impl BusMember<Address> for ScsiController {
                             self.set_phase(ScsiBusPhase::Selection);
                         }
                     }
+                    ScsiBusPhase::Free => {
+                        // Arbitration-free ("fast") selection: a single-initiator
+                        // driver may assert SEL directly from BUS FREE without
+                        // arbitrating first (MR.arbitrate stays 0).  Real 5380
+                        // hardware allows this, and bare-metal drivers (e.g.
+                        // macmon/POSiniX's SCSI boot) rely on it.  Enter Selection
+                        // and immediately try to sample the target ID -- the ODR
+                        // was written before SEL, so no further ODR write comes.
+                        if set.assert_sel() && !self.reg_mr.arbitrate() {
+                            self.set_phase(ScsiBusPhase::Selection);
+                            self.try_complete_selection();
+                        }
+                    }
                     _ => (),
                 }
                 Some(())
