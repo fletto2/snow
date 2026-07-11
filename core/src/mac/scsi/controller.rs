@@ -621,7 +621,7 @@ impl ScsiController {
         // Note that System 7.1 during bulk transfers will read blocks of 512
         // bytes at a time from the DMA region and then use PIO momentarily
         // for some reason.
-        self.read_datareg()
+        self.read_datareg_dma()
     }
 
     pub fn write_dma(&mut self, val: u8) {
@@ -662,6 +662,30 @@ impl ScsiController {
         // to read from the DMA bus region.
         // Needs more investigation at some point...
         if self.reg_mr.dma_mode() && self.phase_match() {
+            self.assert_ack();
+            self.deassert_ack();
+        }
+        val
+    }
+
+    /// Pseudo-DMA (/DACK window) data read.  A read of the DACK data window is a
+    /// DMA-acknowledge cycle: on real 5380 hardware it transfers the current
+    /// byte and pulses ACK -- advancing the REQ/ACK handshake -- gated only by
+    /// /DRQ, which the driver has already polled.  It must NOT gate on
+    /// phase_match() the way the PIO CDR read (read_datareg) does: on the
+    /// bare-metal blind-read path (macmon / POSiniX) REQ is reflected only via
+    /// the deferred `set_req` latch (the driver polls DRQ via BSR and never
+    /// reads CSR, so `reg_csr.req` is never actually set true).  The phase_match
+    /// gate then races Snow's CPU-vs-device step boundary: a data read landing
+    /// in that window returns a stale/duplicate `reg_cdr` WITHOUT advancing,
+    /// intermittently corrupting a DATA-IN transfer (e.g. a superblock reading
+    /// back as zeros -> "Invalid root file system" on ~1 boot in 4).  Dropping
+    /// only the racy phase_match() term (keeping dma_mode() + an explicit
+    /// DataIn guard) leaves the PIO path and MacII/A-UX behaviour unchanged --
+    /// they advanced via dma_mode() && phase_match() and still advance here.
+    fn read_datareg_dma(&mut self) -> u8 {
+        let val = self.reg_cdr;
+        if self.reg_mr.dma_mode() && matches!(self.busphase, ScsiBusPhase::DataIn) {
             self.assert_ack();
             self.deassert_ack();
         }
@@ -742,7 +766,7 @@ impl ScsiController {
 impl BusMember<Address> for ScsiController {
     fn read(&mut self, addr: Address) -> Option<u8> {
         let _is_write = addr & 1 != 0;
-        let _dack = addr & 0b0010_0000_0000 != 0;
+        let dack = addr & 0b0010_0000_0000 != 0;
         let reg = NcrReadReg::from_u32((addr >> 4) & 0b111).unwrap();
 
         //if reg != NcrReadReg::CSR {
@@ -753,7 +777,11 @@ impl BusMember<Address> for ScsiController {
         //}
 
         match reg {
-            NcrReadReg::CDR | NcrReadReg::IDR => Some(self.read_datareg()),
+            NcrReadReg::CDR | NcrReadReg::IDR => Some(if dack {
+                self.read_datareg_dma()
+            } else {
+                self.read_datareg()
+            }),
             NcrReadReg::MR => Some(self.reg_mr.0),
             NcrReadReg::ICR => Some(self.reg_icr.0),
             NcrReadReg::TCR => Some(self.reg_tcr.0),
