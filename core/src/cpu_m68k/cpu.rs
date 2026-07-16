@@ -662,6 +662,14 @@ where
     pub fn step(&mut self) -> Result<()> {
         debug_assert_eq!(self.prefetch.len(), 2);
 
+        if crate::perf::enabled() {
+            // Bracket time-at-elevated-IPL (ISR duration) and emit the periodic
+            // report. Sampling the IPL mask at each step is nesting-safe and does
+            // not depend on matching interrupt entry to RTE.
+            crate::perf::sample_ipl(self.regs.sr.int_prio_mask(), self.cycles);
+            crate::perf::maybe_report(self.cycles);
+        }
+
         self.sync_bus()?;
 
         self.step_ea_addr = None;
@@ -966,6 +974,9 @@ where
 
     /// Raises an IRQ to be executed next
     fn raise_irq(&mut self, level: u8, vector: Address) -> Result<()> {
+        if crate::perf::enabled() {
+            crate::perf::irq(level);
+        }
         let start_cycles = self.cycles;
         let saved_sr = self.regs.sr.sr();
 

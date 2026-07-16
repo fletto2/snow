@@ -888,6 +888,9 @@ impl Scc {
 
 impl BusMember<Address> for Scc {
     fn read(&mut self, addr: Address) -> Option<Byte> {
+        if crate::perf::enabled() {
+            crate::perf::scc_read();
+        }
         let (ch, ctrl) = Self::decode_addr(addr);
         if ctrl {
             Some(self.read_ctrl(ch))
@@ -897,6 +900,9 @@ impl BusMember<Address> for Scc {
     }
 
     fn write(&mut self, addr: Address, val: u8) -> Option<()> {
+        if crate::perf::enabled() {
+            crate::perf::scc_write();
+        }
         let (ch, ctrl) = Self::decode_addr(addr);
         if ctrl {
             Some(self.write_ctrl(ch, val))

@@ -297,6 +297,9 @@ impl Via {
 
 impl BusMember<Address> for Via {
     fn read(&mut self, addr: Address) -> Option<Byte> {
+        if crate::perf::enabled() {
+            crate::perf::via_read();
+        }
         match (addr >> 9) & 0xF {
             // Timer 2 counter LSB
             0x08 => {
@@ -381,6 +384,9 @@ impl BusMember<Address> for Via {
     }
 
     fn write(&mut self, addr: Address, val: Byte) -> Option<()> {
+        if crate::perf::enabled() {
+            crate::perf::via_write();
+        }
         match (addr >> 9) & 0x0F {
             // Timer 2 counter LSB
             0x08 => Some(self.t2latch.set_lsb(val)),
