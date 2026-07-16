@@ -51,6 +51,7 @@ static IRQ_COUNT: [AtomicU64; 8] = [
 static ISR_COUNT: AtomicU64 = AtomicU64::new(0);
 static ISR_CYCLES_SUM: AtomicU64 = AtomicU64::new(0);
 static ISR_CYCLES_MAX: AtomicU64 = AtomicU64::new(0);
+static ISR_CYCLES_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Cycle timestamp when the current elevated-IPL region began (or `NOT_IN_ISR`).
 static ISR_SINCE: AtomicU64 = AtomicU64::new(NOT_IN_ISR);
@@ -112,6 +113,7 @@ pub fn sample_ipl(mask: u8, now: Ticks) {
         ISR_COUNT.fetch_add(1, Relaxed);
         ISR_CYCLES_SUM.fetch_add(dur, Relaxed);
         ISR_CYCLES_MAX.fetch_max(dur, Relaxed);
+        ISR_CYCLES_MIN.fetch_min(dur, Relaxed);
     }
 }
 
@@ -147,6 +149,8 @@ fn report(interval: Ticks) {
     let isr_n = ISR_COUNT.swap(0, Relaxed);
     let isr_sum = ISR_CYCLES_SUM.swap(0, Relaxed);
     let isr_max = ISR_CYCLES_MAX.swap(0, Relaxed);
+    let isr_min = ISR_CYCLES_MIN.swap(u64::MAX, Relaxed);
+    let isr_min = if isr_min == u64::MAX { 0 } else { isr_min };
 
     // Normalise counts to a per-second rate (the interval is ~1 s but rarely
     // exactly ONESEC_CYCLES, since it lands on an instruction boundary).
@@ -158,7 +162,7 @@ fn report(interval: Ticks) {
     info!(
         "[perf/1s] VIA {}r+{}w ({}/s)  SCC {}r+{}w ({}/s)  \
          IRQ L1={} L2={} L4={} L7={} ({}/s)  \
-         ISR n={} mean={}cyc/{:.0}us max={}cyc/{:.0}us  masked={:.1}%",
+         ISR n={} min={}cyc/{:.0}us mean={}cyc/{:.0}us max={}cyc/{:.0}us  masked={:.1}%",
         via_r,
         via_w,
         per_s(via_r + via_w),
@@ -171,6 +175,8 @@ fn report(interval: Ticks) {
         irqs[7],
         per_s(irqs.iter().sum()),
         isr_n,
+        isr_min,
+        us(isr_min),
         isr_mean,
         us(isr_mean),
         isr_max,
