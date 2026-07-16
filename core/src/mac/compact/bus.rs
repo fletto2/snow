@@ -815,6 +815,11 @@ where
     TRenderer: Renderer,
 {
     fn get_irq(&mut self) -> Option<u8> {
+        // Sample VIA level-1 IRQ sources every call (before the SCC/progkey
+        // early-returns can skip it) so the per-source edge count is complete.
+        if crate::perf::enabled() {
+            crate::perf::via_irq_edge((self.via.ifr.0 & self.via.ier.0) & 0x7F);
+        }
         // Programmer's key
         if self.progkey_pressed.get_clear() {
             return Some(4);

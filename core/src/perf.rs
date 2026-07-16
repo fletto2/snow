@@ -55,6 +55,14 @@ static ISR_CYCLES_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Cycle timestamp when the current elevated-IPL region began (or `NOT_IN_ISR`).
 static ISR_SINCE: AtomicU64 = AtomicU64::new(NOT_IN_ISR);
+/// VIA level-1 IRQ triggers, counted per IFR source bit (0..6) on the rising
+/// edge of (IFR & IER).  Bit 1 = CA1 (the 60 Hz VBL tick); everything else is
+/// "excess" -- SR (bit 2, M0110 handshake), T2 (bit 5, kbd handover), etc.
+static VIA_SRC: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+static VIA_SRC_PREV: AtomicU64 = AtomicU64::new(0);
 /// Cycle timestamp of the last emitted report.
 static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
 
@@ -92,6 +100,24 @@ pub fn scc_write() {
 pub fn irq(level: u8) {
     if let Some(c) = IRQ_COUNT.get(level as usize) {
         c.fetch_add(1, Relaxed);
+    }
+}
+
+/// Record the VIA level-1 IRQ sources from the current (IFR & IER) byte (bit 7
+/// masked off).  Counts each source once on its rising edge, so calling this
+/// every CPU step -- most of which see no change -- yields one count per actual
+/// trigger.  bit1=CA1 tick, bit2=SR, bit5=T2, etc.
+#[inline]
+pub fn via_irq_edge(cur: u8) {
+    let prev = VIA_SRC_PREV.swap(cur as u64, Relaxed) as u8;
+    let rising = cur & !prev;
+    if rising == 0 {
+        return;
+    }
+    for bit in 0..7 {
+        if rising & (1 << bit) != 0 {
+            VIA_SRC[bit].fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -150,6 +176,10 @@ fn report(interval: Ticks) {
     let isr_sum = ISR_CYCLES_SUM.swap(0, Relaxed);
     let isr_max = ISR_CYCLES_MAX.swap(0, Relaxed);
     let isr_min = ISR_CYCLES_MIN.swap(u64::MAX, Relaxed);
+    let mut via_src = [0u64; 8];
+    for (i, c) in VIA_SRC.iter().enumerate() {
+        via_src[i] = c.swap(0, Relaxed);
+    }
     let isr_min = if isr_min == u64::MAX { 0 } else { isr_min };
 
     // Normalise counts to a per-second rate (the interval is ~1 s but rarely
@@ -182,5 +212,11 @@ fn report(interval: Ticks) {
         isr_max,
         us(isr_max),
         masked_pct,
+    );
+    // VIA level-1 IRQ source breakdown: CA1 is the 60 Hz tick; the rest are excess.
+    info!(
+        "[perf/1s] VIA-IRQ CA1(tick)={} SR(kbd)={} T2={} T1={} CB1={} CB2={} CA2={}  (excess over tick = {})",
+        via_src[1], via_src[2], via_src[5], via_src[6], via_src[4], via_src[3], via_src[0],
+        via_src.iter().sum::<u64>() - via_src[1],
     );
 }
