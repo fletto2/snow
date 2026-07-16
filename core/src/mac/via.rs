@@ -17,6 +17,10 @@ use super::adb::AdbTransceiver;
 const ONESEC_TICKS: Ticks = 783360;
 
 const SHIFT_DELAY: Ticks = ONESEC_TICKS * 3 / 1000;
+/// How long the M0110 holds an Inquiry ($10) with no key event before answering
+/// $7B (~250 ms).  Modelling this stops macmon re-polling every tick (60/s) and
+/// paces it at the real-hardware rate its own watchdog dictates.
+const INQUIRY_HOLD: Ticks = ONESEC_TICKS / 4;
 
 const ACR_SHIFT_OUT: u8 = 0b111;
 const ACR_SHIFT_IN: u8 = 0b011;
@@ -238,6 +242,9 @@ pub struct Via {
     kbdshift_in_time: Ticks,
     kbdshift_out: u8,
     kbdshift_out_time: Ticks,
+    /// >0 while an Inquiry is being held (M0110 not yet answering); counts down
+    /// to the ~250 ms timeout, or is cleared early when a key event arrives.
+    kbd_inquiry_hold: Ticks,
 
     t1_enable: bool,
 
@@ -287,6 +294,7 @@ impl Via {
             kbdshift_in_time: 0,
             kbdshift_out: 0,
             kbdshift_out_time: 0,
+            kbd_inquiry_hold: 0,
 
             keyboard: PlusKeyboard::default(),
             rtc: Rtc::default(),
@@ -575,7 +583,15 @@ impl Tickable for Via {
             self.kbdshift_out_time = self.kbdshift_out_time.saturating_sub(ticks);
             if self.kbdshift_out_time == 0 {
                 if !self.model.has_adb() {
-                    self.kbdshift_in = self.keyboard.cmd(self.kbdshift_out)?;
+                    match self.keyboard.cmd(self.kbdshift_out)? {
+                        Some(b) => {
+                            self.kbdshift_in = b;
+                            self.kbd_inquiry_hold = 0;
+                        }
+                        // Inquiry with no key: the keyboard holds -- don't commit
+                        // a response byte yet; the receive phase below waits.
+                        None => self.kbd_inquiry_hold = INQUIRY_HOLD,
+                    }
                 } else {
                     self.adb.data_in(self.kbdshift_out);
                 }
@@ -585,6 +601,26 @@ impl Tickable for Via {
         if self.kbdshift_in_time > 0 {
             self.kbdshift_in_time = self.kbdshift_in_time.saturating_sub(ticks);
             if self.kbdshift_in_time == 0 {
+                // Resolve a held Inquiry: the real M0110 clocks nothing back
+                // until a key event arrives or ~250 ms elapses.  Until then,
+                // re-arm and keep waiting instead of delivering a response.
+                if self.kbd_inquiry_hold > 0 && !self.model.has_adb() {
+                    if self.keyboard.pending_events() {
+                        if let Some(b) = self.keyboard.cmd(0x14)? {
+                            self.kbdshift_in = b;
+                        }
+                        self.kbd_inquiry_hold = 0;
+                    } else {
+                        self.kbd_inquiry_hold =
+                            self.kbd_inquiry_hold.saturating_sub(SHIFT_DELAY);
+                        if self.kbd_inquiry_hold == 0 {
+                            self.kbdshift_in = 0x7B; // hold expired -> null
+                        } else {
+                            self.kbdshift_in_time = SHIFT_DELAY; // still holding
+                            return Ok(ticks);
+                        }
+                    }
+                }
                 self.sr = self.kbdshift_in;
                 self.ifr.set_kbdready(true);
                 self.kbdshift_in = self.sr;

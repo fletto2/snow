@@ -53,9 +53,13 @@ impl PlusKeyboard {
         }
     }
 
-    pub fn cmd(&mut self, cmd: u8) -> Result<u8> {
+    /// Process a keyboard command.  Returns the response byte, or `None` for an
+    /// Inquiry ($10) with no key event queued -- the real M0110 HOLDS an Inquiry
+    /// (does not clock a response back) until a key event or ~250 ms elapses, so
+    /// the caller must model that hold.  Instant ($14) always answers at once.
+    pub fn cmd(&mut self, cmd: u8) -> Result<Option<u8>> {
         match cmd {
-            // Inquire/Instant
+            // Inquiry / Instant
             0x10 | 0x14 => {
                 if let Some(ev) = self
                     .event_queue
@@ -72,23 +76,26 @@ impl PlusKeyboard {
                             0x80 | sc
                         }
                     };
-                    Ok(result | 0x01)
+                    Ok(Some(result | 0x01))
+                } else if cmd == 0x10 {
+                    // Inquiry with nothing queued: hold (no response yet).
+                    Ok(None)
                 } else {
-                    // Null
-                    Ok(0x7B)
+                    // Instant: null immediately.
+                    Ok(Some(0x7B))
                 }
             }
             // Model
             0x16 => {
                 // US layout
                 info!("Keyboard reset");
-                Ok(3)
+                Ok(Some(3))
             }
             // Test
-            0x36 => Ok(0x7D),
+            0x36 => Ok(Some(0x7D)),
             _ => {
                 warn!("Unknown keyboard command ${:02X}", cmd);
-                Ok(0)
+                Ok(Some(0))
             }
         }
     }
