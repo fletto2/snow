@@ -301,6 +301,36 @@ where
         };
         let len = std::mem::size_of::<T>();
 
+        // Debug write-watchpoint: SNOW_WATCH="lo:hi" or "lo:hi:vmax" (hex).
+        // Reports writes into [lo,hi) whose value <= vmax (default: any) with
+        // the writing PC -- for catching the store that smashes a stack slot.
+        {
+            use std::sync::OnceLock;
+            static W: OnceLock<Option<(u32, u32, u32)>> = OnceLock::new();
+            let w = W.get_or_init(|| {
+                let s = std::env::var("SNOW_WATCH").ok()?;
+                let p: Vec<&str> = s.split(':').collect();
+                let h = |x: &str| u32::from_str_radix(x.trim_start_matches("0x"), 16).ok();
+                Some((
+                    h(p.first()?)?,
+                    h(p.get(1)?)?,
+                    p.get(2).and_then(|x| h(x)).unwrap_or(u32::MAX),
+                ))
+            });
+            if let Some((lo, hi, vmax)) = *w {
+                let a1 = addr.wrapping_add(len as u32);
+                if a1 > lo && addr < hi {
+                    let v: Long = value.into();
+                    if v <= vmax {
+                        eprintln!(
+                            "[watch] pc={:08X} WRITE [{:08X}]={:08X} len{}",
+                            self.regs.pc, addr, v, len
+                        );
+                    }
+                }
+            }
+        }
+
         match TORDER {
             TORDER_LOWHIGH => {
                 let mut val: Long = value.to_be().into();

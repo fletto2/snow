@@ -379,6 +379,17 @@ pub struct CpuM68k<
 
     /// NMI edge trigger level
     in_nmi: bool,
+
+    /// Env-gated PC-trace ring (`SNOW_PCTRACE=1`).  Records each instruction's
+    /// start PC; dumped (run-length compressed) to stderr on a fatal exception
+    /// (bus/address error, illegal, line-A/F, privilege).  Mirrors the Mini vMac
+    /// PC-trace ring -- for chasing wild jumps / stack-smash bugs.
+    #[serde(skip)]
+    pctrace: Vec<Address>,
+    #[serde(skip)]
+    pctrace_pos: usize,
+    #[serde(skip)]
+    pctrace_on: bool,
 }
 
 impl<
@@ -393,6 +404,70 @@ where
 {
     /// Instruction history size
     pub const HISTORY_SIZE: usize = 10000;
+
+    /// PC-trace ring size (SNOW_PCTRACE)
+    pub const PCTRACE_SIZE: usize = 16384;
+
+    /// Dump the PC-trace ring (oldest -> newest) to stderr with linear-run
+    /// compression (`A..B (n)` for a straight run of sequential PCs), so a long
+    /// history collapses to the branches.  Called on a fatal exception.
+    pub(in crate::cpu_m68k) fn pctrace_dump(&self, why: &str) {
+        if !self.pctrace_on || self.pctrace.is_empty() {
+            return;
+        }
+        // Walk the ring oldest-first starting just after the newest write.
+        let n = self.pctrace.len();
+        let mut seq: Vec<Address> = Vec::with_capacity(n);
+        for i in 0..n {
+            let pc = self.pctrace[(self.pctrace_pos + i) % n];
+            // Skip the zero-fill from before the ring wrapped once.
+            if pc == 0 && seq.is_empty() {
+                continue;
+            }
+            seq.push(pc);
+        }
+        eprintln!(
+            "\n=== SNOW PC-TRACE ({}) -- {} entries, oldest first ===",
+            why,
+            seq.len()
+        );
+        let mut i = 0;
+        let mut line = String::new();
+        let mut items = 0;
+        while i < seq.len() {
+            // Detect a linear run: consecutive PCs each +2 or +4 from the last.
+            let run_start = i;
+            let mut j = i + 1;
+            while j < seq.len() {
+                let d = seq[j].wrapping_sub(seq[j - 1]);
+                if d == 2 || d == 4 {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let run = j - run_start;
+            if run >= 3 {
+                line.push_str(&format!(
+                    "{:06X}..{:06X}({}) ",
+                    seq[run_start], seq[j - 1], run
+                ));
+                i = j;
+            } else {
+                line.push_str(&format!("{:06X} ", seq[i]));
+                i += 1;
+            }
+            items += 1;
+            if items % 8 == 0 {
+                eprintln!("{}", line.trim_end());
+                line.clear();
+            }
+        }
+        if !line.is_empty() {
+            eprintln!("{}", line.trim_end());
+        }
+        eprintln!("=== end PC-trace ===\n");
+    }
 
     pub fn new(bus: TBus) -> Self {
         assert!([M68000, M68020, M68030].contains(&CPU_TYPE));
@@ -422,6 +497,13 @@ where
             icache_tags: [ICACHE_TAG_INVALID; ICACHE_LINES],
             restart_regs: None,
             in_nmi: false,
+            pctrace_on: std::env::var("SNOW_PCTRACE").is_ok(),
+            pctrace: if std::env::var("SNOW_PCTRACE").is_ok() {
+                vec![0; Self::PCTRACE_SIZE]
+            } else {
+                Vec::new()
+            },
+            pctrace_pos: 0,
         }
     }
 
@@ -694,6 +776,11 @@ where
 
         let start_cycles = self.cycles;
         let start_pc = self.regs.pc;
+        if self.pctrace_on {
+            let pos = self.pctrace_pos;
+            self.pctrace[pos] = start_pc;
+            self.pctrace_pos = (pos + 1) % self.pctrace.len();
+        }
         let opcode = match self.fetch() {
             Ok(o) => o,
             Err(e) => {
@@ -1055,6 +1142,37 @@ where
         vector: Address,
         details: Option<Group0Details>,
     ) -> Result<()> {
+        // PC-trace: dump the ring on a fatal exception (bus/address error,
+        // illegal, line-A/F) -- the ones that signal a crash, not a normal
+        // trap/IRQ.  Uses the byte-address vector form.
+        if self.pctrace_on
+            && matches!(
+                vector,
+                VECTOR_BUS_ERROR
+                    | VECTOR_ADDRESS_ERROR
+                    | VECTOR_ILLEGAL
+                    | VECTOR_LINEA
+                    | VECTOR_LINEF
+            )
+        {
+            let why = match vector {
+                VECTOR_BUS_ERROR => "bus error",
+                VECTOR_ADDRESS_ERROR => "address error",
+                VECTOR_ILLEGAL => "illegal instruction",
+                VECTOR_LINEA => "line-A",
+                VECTOR_LINEF => "line-F",
+                _ => "fatal",
+            };
+            eprintln!(
+                "[pctrace] fatal vector {:#06X} ({}) at PC={:08X} SR={:04X}",
+                vector,
+                why,
+                self.regs.pc,
+                self.regs.sr.sr()
+            );
+            self.pctrace_dump(why);
+        }
+
         let start_cycles = self.cycles;
         let mut saved_sr = self.regs.sr.sr();
 
