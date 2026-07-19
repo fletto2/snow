@@ -390,6 +390,13 @@ pub struct CpuM68k<
     pctrace_pos: usize,
     #[serde(skip)]
     pctrace_on: bool,
+    /// SNOW_DUMP_AT=<hexaddr>: dump the PC-trace ring + registers the first time
+    /// the PC reaches this address (e.g. the kernel halt/panic path) -- for
+    /// software panics that never raise a CPU exception.
+    #[serde(skip)]
+    pctrace_dump_at: Option<Address>,
+    #[serde(skip)]
+    pctrace_dump_done: bool,
 }
 
 impl<
@@ -407,6 +414,34 @@ where
 
     /// PC-trace ring size (SNOW_PCTRACE)
     pub const PCTRACE_SIZE: usize = 16384;
+
+    /// Dump the CPU register file to stderr (for a fatal exception / panic).
+    pub(in crate::cpu_m68k) fn dump_regs(&self) {
+        let sp: Long = self.regs.read_a(7);
+        eprintln!(
+            "[regs] PC={:08X} SR={:04X} SP={:08X} USP={:08X}",
+            self.regs.pc,
+            self.regs.sr.sr(),
+            sp,
+            self.regs.usp
+        );
+        eprintln!(
+            "[regs] D0-3 {:08X} {:08X} {:08X} {:08X}",
+            self.regs.d[0], self.regs.d[1], self.regs.d[2], self.regs.d[3]
+        );
+        eprintln!(
+            "[regs] D4-7 {:08X} {:08X} {:08X} {:08X}",
+            self.regs.d[4], self.regs.d[5], self.regs.d[6], self.regs.d[7]
+        );
+        eprintln!(
+            "[regs] A0-3 {:08X} {:08X} {:08X} {:08X}",
+            self.regs.a[0], self.regs.a[1], self.regs.a[2], self.regs.a[3]
+        );
+        eprintln!(
+            "[regs] A4-6 {:08X} {:08X} {:08X}",
+            self.regs.a[4], self.regs.a[5], self.regs.a[6]
+        );
+    }
 
     /// Dump the PC-trace ring (oldest -> newest) to stderr with linear-run
     /// compression (`A..B (n)` for a straight run of sequential PCs), so a long
@@ -504,6 +539,10 @@ where
                 Vec::new()
             },
             pctrace_pos: 0,
+            pctrace_dump_at: std::env::var("SNOW_DUMP_AT")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+            pctrace_dump_done: false,
         }
     }
 
@@ -780,6 +819,12 @@ where
             let pos = self.pctrace_pos;
             self.pctrace[pos] = start_pc;
             self.pctrace_pos = (pos + 1) % self.pctrace.len();
+        }
+        if !self.pctrace_dump_done && self.pctrace_dump_at == Some(start_pc) {
+            self.pctrace_dump_done = true;
+            eprintln!("[pctrace] reached SNOW_DUMP_AT={:08X}", start_pc);
+            self.dump_regs();
+            self.pctrace_dump("SNOW_DUMP_AT");
         }
         let opcode = match self.fetch() {
             Ok(o) => o,
@@ -1170,6 +1215,7 @@ where
                 self.regs.pc,
                 self.regs.sr.sr()
             );
+            self.dump_regs();
             self.pctrace_dump(why);
         }
 
