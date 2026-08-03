@@ -791,6 +791,34 @@ where
             crate::perf::maybe_report(self.cycles);
         }
 
+        // SNOW_SAMPLE: coarse PC-bucket sampler.  Every 256 steps, bump a 4 KB
+        // bucket for self.regs.pc; every 2M samples dump the top buckets so we
+        // can see WHERE the CPU spends time under load (which the IPL report
+        // can't localize).  Buckets are addr>>12.
+        if std::env::var("SNOW_SAMPLE").is_ok() {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            use std::sync::Mutex;
+            static SKIP: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            static HIST: Mutex<Option<std::collections::HashMap<u32, u64>>> = Mutex::new(None);
+            if SKIP.fetch_add(1, Relaxed) & 0x3F == 0 {
+                let bucket = (self.regs.pc >> 12) as u32;
+                let mut g = HIST.lock().unwrap();
+                let h = g.get_or_insert_with(std::collections::HashMap::new);
+                *h.entry(bucket).or_insert(0) += 1;
+                if N.fetch_add(1, Relaxed) % 200_000 == 199_999 {
+                    let mut v: Vec<_> = h.iter().map(|(k, c)| (*c, *k)).collect();
+                    v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let total: u64 = v.iter().map(|x| x.0).sum();
+                    let top: Vec<String> = v.iter().take(8)
+                        .map(|(c, b)| format!("{:#08x}:{:.0}%", (*b as u32) << 12, 100.0 * *c as f64 / total as f64))
+                        .collect();
+                    eprintln!("[sample] top PC-4K buckets: {}", top.join(" "));
+                    h.clear();
+                }
+            }
+        }
+
         self.sync_bus()?;
 
         self.step_ea_addr = None;

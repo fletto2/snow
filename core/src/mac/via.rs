@@ -25,6 +25,11 @@ const INQUIRY_HOLD: Ticks = ONESEC_TICKS / 4;
 const ACR_SHIFT_OUT: u8 = 0b111;
 const ACR_SHIFT_IN: u8 = 0b011;
 
+// SNOW_WATCH_IER T1 diagnostics
+static T1_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T1CH_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T1CL_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 bitfield! {
     /// VIA Register A (for classic models)
     #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +325,7 @@ impl BusMember<Address> for Via {
             // Timer 1 counter LSB
             0x04 => {
                 self.ifr.set_t1(false);
+                T1CL_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Some(self.t1cnt.lsb())
             }
             // Timer 1 counter MSB
@@ -429,6 +435,7 @@ impl BusMember<Address> for Via {
             0x05 => {
                 self.t1latch.set_msb(val);
                 self.t1cnt.0 = self.t1latch.0;
+                T1CH_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 // Clear interrupt flag
                 self.ifr.set_t1(false);
@@ -497,7 +504,12 @@ impl BusMember<Address> for Via {
                     self.kbdshift_out = self.sr;
                     self.kbdshift_out_time = SHIFT_DELAY;
                 }
-
+                // SNOW_WATCH_IER: flag when ACR bit 6 (T1 free-run reload) is
+                // cleared -- that switches T1 to one-shot, so the tick stops
+                // after its next fire.
+                if std::env::var("SNOW_WATCH_IER").is_ok() && (self.acr.0 & 0x40) != 0 && (val & 0x40) == 0 {
+                    eprintln!("[ACR] val={:#04x} {:#04x}->{:#04x}  *** LOST T1 FREE-RUN (bit6) ***", val, self.acr.0, val);
+                }
                 Some(self.acr.0 = val)
             }
 
@@ -512,6 +524,7 @@ impl BusMember<Address> for Via {
 
             // Interrupt Enable register
             0x0E => {
+                let old = self.ier.0;
                 let newflags = if val & 0x80 != 0 {
                     // Enable
                     RegisterIRQ(self.ier.0 | (val & 0x7F))
@@ -520,6 +533,20 @@ impl BusMember<Address> for Via {
                     RegisterIRQ(self.ier.0 & !(val & 0x7F))
                 };
                 self.ier = newflags;
+                // SNOW_WATCH_IER: log every IER write; flag when the T1 tick (0x40)
+                // or CA1 (0x02) enable transitions 1->0 (loses the clock tick).
+                if std::env::var("SNOW_WATCH_IER").is_ok() {
+                    let lost_t1 = (old & 0x40) != 0 && (newflags.0 & 0x40) == 0;
+                    let lost_ca1 = (old & 0x02) != 0 && (newflags.0 & 0x02) == 0;
+                    eprintln!(
+                        "[IER] write val={:#04x} ({}) IER {:#04x}->{:#04x}{}{}",
+                        val,
+                        if val & 0x80 != 0 { "SET" } else { "CLR" },
+                        old, newflags.0,
+                        if lost_t1 { "  *** LOST T1 TICK ***" } else { "" },
+                        if lost_ca1 { "  *** LOST CA1 ***" } else { "" },
+                    );
+                }
                 Some(())
             }
 
@@ -539,6 +566,21 @@ impl BusMember<Address> for Via {
 
 impl Tickable for Via {
     fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
+        // SNOW_WATCH_IER: periodic dump of T1 health -- fires, T1CH-resets,
+        // enable/free-run/IER state -- to see whether the tick T1 stops
+        // overflowing under load and why.
+        if std::env::var("SNOW_WATCH_IER").is_ok() {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            if CALLS.fetch_add(1, Relaxed) % 3_000_000 == 2_999_999 {
+                eprintln!(
+                    "[T1] fires={} t1ch_resets={} t1cl_reads={} | t1_enable={} freerun={} ier_t1={} t1cnt={:#06x} latch={:#06x}",
+                    T1_FIRES.load(Relaxed), T1CH_RESETS.load(Relaxed), T1CL_READS.load(Relaxed),
+                    self.t1_enable, self.acr.t1_freerun(), (self.ier.0 & 0x40) != 0,
+                    self.t1cnt.0, self.t1latch.0,
+                );
+            }
+        }
         // This is ticked on the E Clock
         self.onesec += ticks;
 
@@ -554,6 +596,7 @@ impl Tickable for Via {
         (self.t1cnt.0, t1ovf) = self.t1cnt.0.overflowing_sub(ticks.try_into()?);
 
         if t1ovf && self.t1_enable {
+            T1_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.ifr.set_t1(true);
             if !self.acr.t1_freerun() {
                 // Single shot mode
