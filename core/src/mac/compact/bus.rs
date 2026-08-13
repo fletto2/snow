@@ -166,7 +166,14 @@ where
 
             rom: Vec::from(rom),
             extension_rom: extension_rom.map(Vec::from).unwrap_or_default(),
-            ram: vec![0; ram_size],
+            // Power-on RAM is NOT zero on a real machine, it is undefined.  Fill
+            // with an alternating $55/$AA pattern so firmware that accidentally
+            // depends on zeroed RAM (uninitialized variables, missing BSS clear)
+            // fails here the way it fails on real hardware instead of silently
+            // working.  Word-aligned reads see $55AA.
+            ram: (0..ram_size)
+                .map(|i| if i % 2 == 0 { 0x55u8 } else { 0xAAu8 })
+                .collect(),
             ram_dirty: BitSet::from_iter(0..(ram_size / RAM_DIRTY_PAGESIZE)),
             via: Via::new(model),
             video: Video::new(renderer),
@@ -668,8 +675,12 @@ where
 
     fn reset(&mut self, hard: bool) -> Result<bool> {
         if hard {
-            // Clear RAM
-            self.ram.fill(0);
+            // Repaint RAM with the power-on $55/$AA pattern rather than zeroing
+            // it: a hard reset on real hardware does not clear DRAM, and firmware
+            // that depends on zeroed RAM should fail here like it does on metal.
+            for (i, b) in self.ram.iter_mut().enumerate() {
+                *b = if i % 2 == 0 { 0x55 } else { 0xAA };
+            }
 
             // Disable memory test
             if let Some((addr, value)) = self.model.disable_memtest() {
