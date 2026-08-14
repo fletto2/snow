@@ -8,4 +8,5 @@
 
 pub mod audio;
 pub mod bus;
+pub mod dram;
 pub mod video;

@@ -3,6 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::audio::AudioState;
+use super::dram::DramDecay;
 use super::video::Video;
 use crate::bus::{Address, Bus, BusMember, BusResult, InspectableBus, IrqSource};
 use crate::debuggable::Debuggable;
@@ -47,6 +48,12 @@ pub struct CompactMacBus<TRenderer: Renderer> {
 
     /// RAM pages (RAM_DIRTY_PAGESIZE bytes) written
     pub(crate) ram_dirty: BitSet,
+
+    /// Optional DRAM row decay model (off unless SNOW_DRAM_DECAY=1). Models the
+    /// fact that video refresh sweeps only RA0..RA8, so on a 1M-chip board the
+    /// RA9 (= A19) half of the array is refreshed by CPU accesses alone.
+    #[serde(skip)]
+    dram_decay: Option<DramDecay>,
 
     pub(crate) via: Via,
     pub(crate) scc: Scc,
@@ -185,6 +192,7 @@ where
             mouse_ready: false,
 
             ram_mask: (ram_size - 1),
+            dram_decay: DramDecay::from_env(ram_size),
             rom_mask: rom.len() - 1,
 
             fb_main: fb_main_start
@@ -282,6 +290,14 @@ where
         T::from_u32(u32::from_be_bytes(tmp)).unwrap()
     }
 
+    /// Records a CPU RAS strobe for this address' DRAM row (decay model only).
+    #[inline]
+    fn dram_touch(&mut self, idx: usize) {
+        if let Some(d) = self.dram_decay.as_mut() {
+            d.touch(idx);
+        }
+    }
+
     fn write_overlay(&mut self, addr: Address, val: Byte) -> Option<()> {
         match addr {
             // ROM (disables overlay)
@@ -295,6 +311,7 @@ where
             0x0060_0000..=0x007F_FFFF => {
                 let idx = ((addr as usize) - 0x60_0000) & self.ram_mask;
                 self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+                self.dram_touch(idx);
                 Some(self.ram[idx] = val)
             }
             // SCC
@@ -324,6 +341,7 @@ where
 
                 let idx = addr as usize & self.ram_mask;
                 self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+                self.dram_touch(idx);
                 Some(self.ram[idx] = val)
             }
             // SCSI
@@ -361,7 +379,11 @@ where
             // SCSI
             0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.read(addr),
             // RAM
-            0x0060_0000..=0x007F_FFFF => Some(self.ram[addr as usize & self.ram_mask]),
+            0x0060_0000..=0x007F_FFFF => {
+                let idx = addr as usize & self.ram_mask;
+                self.dram_touch(idx);
+                Some(self.ram[idx])
+            }
             // Phase adjust (ignore)
             0x009F_FFF7 | 0x009F_FFF9 => Some(0),
             // SCC
@@ -388,7 +410,9 @@ where
         match addr {
             // RAM
             0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF => {
-                Some(self.ram[addr as usize & self.ram_mask])
+                let idx = addr as usize & self.ram_mask;
+                self.dram_touch(idx);
+                Some(self.ram[idx])
             }
             // ROM
             0x0040_0000..=0x0043_FFFF => Some(
@@ -748,6 +772,16 @@ where
             // VBlank interrupt
             if self.video.get_clr_vblank() {
                 self.via.ifr.set_vblank(true);
+
+                // DRAM decay: apply the video scan's partial refresh (RA0..RA8
+                // only, RA9 held static) and rot any row that has gone too long
+                // without a RAS from anyone.
+                if let Some(mut d) = self.dram_decay.take() {
+                    for idx in d.vblank(&mut self.ram, self.ram_mask) {
+                        self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+                    }
+                    self.dram_decay = Some(d);
+                }
 
                 match self.speed {
                     EmulatorSpeed::Video => {
