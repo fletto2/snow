@@ -65,6 +65,31 @@ const NRAM: usize = 4;
 const NFLASH: usize = 16;
 const NV_SIZE: usize = 4096;
 
+/// Fault-injection settings. These exist to exercise a HOST'S ERROR HANDLING,
+/// which is the half of correctness a happy-path model cannot reach: a guard
+/// nobody has watched fire is a claim, not a feature.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct Faults {
+    /// Devices disagree about which RAM slot is active. A host picks its write
+    /// destination AGAINST that field, so on a broadcast bus a disagreement
+    /// means one device's answer choosing a slot that is LIVE on another.
+    skew: bool,
+    /// Stop maintaining the back-channel after N commands: the host issues a
+    /// command and watches a token that never moves.
+    deaf: u32,
+    /// Start already in command-response mode, as a device left that way by a
+    /// host reset mid-session really is -- a Mac reset restarts the CPU and
+    /// NOT the One ROM. In that state no knock is needed and every read on the
+    /// command page decodes as a command.
+    entered: bool,
+    /// Refuse SLOT_PEEK: the state in which a read-back verify proves nothing
+    /// and must say so rather than passing.
+    nopeek: bool,
+    /// 1 = LOAD_SLOT refuses; 2 = it fails HALF DONE, leaving the target slot
+    /// holding part of an image.
+    loadfail: u8,
+}
+
 /// Reserved protocol values. A device that does not know an answer reports one
 /// of these, so they must never be accepted as a slot number.
 const RESERVED_AA: u8 = 0xAA;
@@ -86,6 +111,7 @@ struct Dev {
 
     st: St,
     kmatch: usize,
+    kmax: usize,
     group: u8,
     cmd: u8,
     args: [u8; 16],
@@ -120,6 +146,7 @@ impl Dev {
             active_slot: 0,
             st: St::Knock,
             kmatch: 0,
+            kmax: 0,
             group: 0,
             cmd: 0,
             args: [0; 16],
@@ -246,6 +273,7 @@ pub struct OneRom {
     base: u32,
     per_dev: u32,
     swap: bool,
+    faults: Faults,
 }
 
 impl OneRom {
@@ -256,6 +284,8 @@ impl OneRom {
     /// * `SNOW_ONEROM_DEVS`       - devices on the bus (default 2, one per lane)
     /// * `SNOW_ONEROM_FLASH`      - flash slots each device reports (default 3)
     /// * `SNOW_ONEROM_RAMSLOTS`   - RAM slots each device reports (default 2)
+    /// * `SNOW_ONEROM_NV0`        - preload NV byte 0 (the saved default slot);
+    ///                              absent leaves NV blank (0xFF = nothing saved)
     pub fn from_env(rom: &[u8]) -> Option<Self> {
         if std::env::var("SNOW_ONEROM").ok().as_deref() != Some("1") {
             return None;
@@ -278,6 +308,22 @@ impl OneRom {
         let ndev = num("SNOW_ONEROM_DEVS", 2).clamp(1, 4) as usize;
         let nflash = num("SNOW_ONEROM_FLASH", 3).clamp(1, NFLASH as u32) as usize;
         let nram = num("SNOW_ONEROM_RAMSLOTS", 2).clamp(1, NRAM as u32) as usize;
+        // NV byte 0 is where both hosts keep the default boot slot. Blank NV is
+        // 0xFF ("nothing saved"), and with that a boot menu's honest default is
+        // the slot it is already running -- which a switch must refuse. So a
+        // preloaded value is what makes the SWITCH path reachable at all.
+        let nv0 = std::env::var("SNOW_ONEROM_NV0")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok());
+
+        let flag = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+        let faults = Faults {
+            skew: flag("SNOW_ONEROM_SKEW"),
+            deaf: num("SNOW_ONEROM_DEAF", 0),
+            entered: flag("SNOW_ONEROM_ENTERED"),
+            nopeek: flag("SNOW_ONEROM_NOPEEK"),
+            loadfail: num("SNOW_ONEROM_LOADFAIL", 0) as u8,
+        };
 
         let dev_bytes: u32 = 1; // two 8-bit devices on a 16-bit bus
         let stride = ndev as u32 * dev_bytes;
@@ -285,7 +331,13 @@ impl OneRom {
 
         let mut s = Self {
             devs: (0..ndev)
-                .map(|i| Dev::new(i, per_dev, nram, nflash))
+                .map(|i| {
+                    let mut d = Dev::new(i, per_dev, nram, nflash);
+                    if let Some(v) = nv0 {
+                        d.nv[0] = v;
+                    }
+                    d
+                })
                 .collect(),
             ndev,
             gated: true,
@@ -294,7 +346,32 @@ impl OneRom {
             base,
             per_dev,
             swap: dev_bytes == 2,
+            faults,
         };
+
+        // A device left in command-response mode by a host reset. The page and
+        // back-channel default to MacGrub's own configuration, since that is
+        // the host this state is most likely to be inherited from.
+        if faults.entered {
+            let page = num("SNOW_ONEROM_ENTERED_PAGE", 0xE0) as u16;
+            let bch = num("SNOW_ONEROM_ENTERED_BCH", 0xE100);
+            for d in s.devs.iter_mut() {
+                d.active = true;
+                d.cmd_page = page;
+                d.region_off = bch;
+                d.data_size = 160 - HDR_SIZE;
+                d.complete = 0xBB;
+                d.status_ok = 0xCC;
+            }
+        }
+        // Devices disagreeing about the active slot.
+        if faults.skew {
+            for (i, d) in s.devs.iter_mut().enumerate() {
+                if i > 0 && nram > 1 {
+                    d.active_slot = 1;
+                }
+            }
+        }
 
         // Seed every slot with the ROM image the machine was launched with,
         // split across the devices exactly as the hardware splits it. Without
@@ -359,10 +436,10 @@ impl OneRom {
 
         if width >= 2 || !self.gated {
             for i in 0..self.ndev {
-                feed(&mut self.devs[i], observed);
+                feed(&mut self.devs[i], observed, &self.faults);
             }
         } else {
-            feed(&mut self.devs[lane], observed);
+            feed(&mut self.devs[lane], observed, &self.faults);
         }
         self.fetch(addr)
     }
@@ -390,7 +467,7 @@ impl OneRom {
 }
 
 /// Feed one observed bus cycle to a device's state machine.
-fn feed(d: &mut Dev, observed: u32) {
+fn feed(d: &mut Dev, observed: u32, faults: &Faults) {
     // Once entered, only reads on the command page are commands; everything
     // else is an ordinary fetch of the image being served.
     if d.active && (observed >> 8) != d.cmd_page as u32 {
@@ -405,8 +482,24 @@ fn feed(d: &mut Dev, observed: u32) {
                 if d.kmatch == KNOCK.len() {
                     d.kmatch = 0;
                     d.st = St::Group;
+                    if std::env::var("SNOW_ONEROM_TRACE").ok().as_deref() == Some("1") {
+                        log::warn!("[onerom] dev{} KNOCK accepted", d.idx);
+                    }
                 }
             } else {
+                // Record how far the knock ever got before being broken. A host
+                // whose OWN INSTRUCTION FETCHES come from this window
+                // interleaves them with its command reads, and the device
+                // cannot tell the two apart -- so the sequence never completes.
+                if d.kmatch > d.kmax {
+                    d.kmax = d.kmatch;
+                    if std::env::var("SNOW_ONEROM_TRACE").ok().as_deref() == Some("1") {
+                        log::warn!(
+                            "[onerom] dev{} knock reached {}/{} then broke on {:02X}",
+                            d.idx, d.kmatch, KNOCK.len(), b
+                        );
+                    }
+                }
                 d.kmatch = usize::from(b == KNOCK[0]);
             }
         }
@@ -419,7 +512,7 @@ fn feed(d: &mut Dev, observed: u32) {
             d.nargs = 0;
             d.want = arg_count(d.group, d.cmd);
             if d.want == 0 {
-                run_command(d);
+                run_command(d, faults);
                 d.st = if d.active { St::Group } else { St::Knock };
             } else {
                 d.st = St::Args;
@@ -431,7 +524,7 @@ fn feed(d: &mut Dev, observed: u32) {
             }
             d.nargs += 1;
             if d.nargs >= d.want {
-                run_command(d);
+                run_command(d, faults);
                 d.st = if d.active { St::Group } else { St::Knock };
             }
         }
@@ -451,8 +544,21 @@ fn cmd_is_silent(g: u8, c: u8) -> bool {
     }
 }
 
-fn run_command(d: &mut Dev) {
+fn run_command(d: &mut Dev, faults: &Faults) {
     let was = d.active;
+    // Deaf: execute the command but write nothing back, so the host sees a
+    // token that never moves and must time out rather than hang.
+    if faults.deaf > 0 && d.cmds >= faults.deaf {
+        let _ = dispatch(d, faults);
+        d.cmds += 1;
+        return;
+    }
+    if std::env::var("SNOW_ONEROM_TRACE").ok().as_deref() == Some("1") {
+        log::warn!(
+            "[onerom] dev{} #{} g={:02X} c={:02X} args={:02X?} active={}",
+            d.idx, d.cmds, d.group, d.cmd, &d.args[..d.want.min(9)], was
+        );
+    }
     let silent = cmd_is_silent(d.group, d.cmd);
 
     // The header can only be written while a region is known, which is why the
@@ -462,7 +568,7 @@ fn run_command(d: &mut Dev) {
         d.cmd_begin(g, c);
     }
 
-    let ok = dispatch(d);
+    let ok = dispatch(d, faults);
 
     if was && !silent {
         d.cmd_end(ok);
@@ -478,7 +584,7 @@ fn run_command(d: &mut Dev) {
     d.cmds += 1;
 }
 
-fn dispatch(d: &mut Dev) -> bool {
+fn dispatch(d: &mut Dev, faults: &Faults) -> bool {
     match d.group {
         // RESET resynchronises a device whose session has desynchronised, so
         // it must work in ANY state and must not touch the back-channel.
@@ -581,6 +687,9 @@ fn dispatch(d: &mut Dev) -> bool {
                 }
                 0x07 => {
                     // SLOT_PEEK: read back what a poke wrote
+                    if faults.nopeek {
+                        return false;
+                    }
                     let count = d.args[0] as u32;
                     let addr = d.args[1] as u32
                         | (d.args[2] as u32) << 8
@@ -640,6 +749,18 @@ fn dispatch(d: &mut Dev) -> bool {
                     // LOAD_SLOT: copy a flash image into a RAM slot
                     let (r, f) = (d.args[0] as usize, d.args[1] as usize);
                     if d.args[0] == RESERVED_AA || r >= d.nram || f >= d.nflash {
+                        return false;
+                    }
+                    if faults.loadfail == 1 {
+                        return false;
+                    }
+                    if faults.loadfail == 2 {
+                        // HALF DONE: the target slot now holds part of an
+                        // image. This is why "nothing was changed" is a lie
+                        // after a failed write, and why a host must say a
+                        // spare slot may hold a fragment.
+                        let half = d.size as usize / 2;
+                        d.ram[r][..half].copy_from_slice(&d.flash[f][..half]);
                         return false;
                     }
                     d.ram[r] = d.flash[f].clone();
