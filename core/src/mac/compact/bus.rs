@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::audio::AudioState;
 use super::dram::DramDecay;
+use super::onerom::OneRom;
 use super::video::Video;
 use crate::bus::{Address, Bus, BusMember, BusResult, InspectableBus, IrqSource};
 use crate::debuggable::Debuggable;
@@ -54,6 +55,13 @@ pub struct CompactMacBus<TRenderer: Renderer> {
     /// RA9 (= A19) half of the array is refreshed by CPU accesses alone.
     #[serde(skip)]
     dram_decay: Option<DramDecay>,
+
+    /// Optional One ROM device model (off unless SNOW_ONEROM=1).  When present
+    /// it OWNS the ROM window: reads are fed to its state machine and served
+    /// from the slot it is currently serving, so a guest can drive the RBCP
+    /// protocol and switch images the way real hardware would.
+    #[serde(skip)]
+    onerom: Option<OneRom>,
 
     pub(crate) via: Via,
     pub(crate) scc: Scc,
@@ -193,6 +201,7 @@ where
 
             ram_mask: (ram_size - 1),
             dram_decay: DramDecay::from_env(ram_size),
+            onerom: OneRom::from_env(&rom),
             rom_mask: rom.len() - 1,
 
             fb_main: fb_main_start
@@ -415,12 +424,24 @@ where
                 Some(self.ram[idx])
             }
             // ROM
-            0x0040_0000..=0x0043_FFFF => Some(
-                *self
-                    .rom
-                    .get(addr as usize & self.rom_mask)
-                    .unwrap_or(&self.openbus[(addr & 1) as usize]),
-            ),
+            0x0040_0000..=0x0043_FFFF => {
+                // With a One ROM fitted, the device OWNS this window: every
+                // read is a bus cycle it observes (a command byte is sent by
+                // READING an address on its command page), and the byte served
+                // comes from whichever slot it is currently serving rather
+                // than from the static image.
+                if let Some(or) = self.onerom.as_mut() {
+                    if or.covers(addr) {
+                        return Some(or.access(addr, 1));
+                    }
+                }
+                Some(
+                    *self
+                        .rom
+                        .get(addr as usize & self.rom_mask)
+                        .unwrap_or(&self.openbus[(addr & 1) as usize]),
+                )
+            }
             0x0044_0000..=0x004F_FFFF => {
                 if self.model == MacModel::Plus {
                     // Plus with SCSI has no repeated ROM images above 0x440000 as
