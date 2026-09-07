@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::{
     bus::{Address, BusMember},
+    tickable::Ticks,
     types::Byte,
 };
 use log::*;
@@ -268,6 +269,20 @@ struct SccChannel {
 
     tx_queue: VecDeque<u8>,
     rx_queue: VecDeque<u8>,
+    /// Bytes that have ARRIVED at the port but have not been clocked in yet.
+    ///
+    /// A serial line delivers one byte per ten bit times and nothing faster.
+    /// Without that, a host writing a kilobyte to the bridge had the whole
+    /// kilobyte appear in the guest's receive queue in one instant with ONE
+    /// receive interrupt raised for the batch, so a guest ISR that reads one
+    /// byte per interrupt saw the first byte and silently lost the rest.
+    /// That is why driving these machines needed a ~20 ms pause between typed
+    /// characters, and why a 263-byte frame did not survive while a 64-byte
+    /// one did.  These bytes are released into rx_queue on a timer at the
+    /// channel's own configured baud rate instead.
+    rx_pending: VecDeque<u8>,
+    /// CPU cycles accumulated toward the next byte's arrival.
+    rx_cycles: Ticks,
 
     /// SDLC station address (WR6) - used for LocalTalk node address
     sdlc_address: u8,
@@ -765,10 +780,69 @@ impl Scc {
             return;
         }
 
-        self.ch[chi].rx_queue.extend(data.iter());
-        // Set interrupt if enabled (rx_int_mode 1 or 2)
-        if self.mic.mie() && self.ch[chi].rx_int_mode != 0 {
-            self.ch[chi].rx_ip = true;
+        // Held for the line to clock in, one byte per ten bit times, rather
+        // than handed over whole.  tick_rx releases them and raises the
+        // receive interrupt per byte, which is what a real port does and what
+        // a guest ISR reading one byte per interrupt expects.
+        self.ch[chi].rx_pending.extend(data.iter());
+    }
+
+    /// Bytes a channel has accepted but not yet clocked in.
+    pub fn rx_pending_len(&self, ch: SccCh) -> usize {
+        self.ch[ch.to_usize().unwrap()].rx_pending.len()
+    }
+
+    /// CPU cycles one received byte occupies on the wire.
+    ///
+    /// Ten bit times for the ordinary 8N1 case, more when the framing says so.
+    /// A channel that has not been configured yet, or one in sync mode, is
+    /// paced at 9600 8N1 -- what everything on these machines uses, and far
+    /// closer than delivering instantly.
+    fn rx_cycles_per_byte(&self, chi: usize) -> Ticks {
+        const CPU_HZ: Ticks = 7_833_600;
+        const SCC_PCLK: u32 = 3_672_000;
+
+        let c = &self.ch[chi];
+        let wr4 = WrReg4(c.wr4);
+        let divisor = match wr4.clock_rate() {
+            0 => 1u32,
+            1 => 16,
+            2 => 32,
+            _ => 64,
+        };
+        let tc = ((c.wr13 as u32) << 8) | (c.wr12 as u32);
+        let baud = if wr4.stop_bits() == 0 || divisor == 1 {
+            9600
+        } else {
+            (SCC_PCLK / (2 * (tc + 2)) / divisor).max(50)
+        };
+        let bits: Ticks = (match wr4.stop_bits() {
+            2 | 3 => 11,
+            _ => 10,
+        }) + if wr4.parity_enable() { 1 } else { 0 };
+
+        (CPU_HZ * bits / (baud as Ticks)).max(1)
+    }
+
+    /// Clock pending receive bytes in at the line rate.
+    pub fn tick_rx(&mut self, ticks: Ticks) {
+        for chi in 0..2 {
+            if self.ch[chi].rx_pending.is_empty() {
+                self.ch[chi].rx_cycles = 0;
+                continue;
+            }
+            let per = self.rx_cycles_per_byte(chi);
+            self.ch[chi].rx_cycles += ticks;
+            while self.ch[chi].rx_cycles >= per {
+                let Some(b) = self.ch[chi].rx_pending.pop_front() else {
+                    break;
+                };
+                self.ch[chi].rx_cycles -= per;
+                self.ch[chi].rx_queue.push_back(b);
+                if self.mic.mie() && self.ch[chi].rx_int_mode != 0 {
+                    self.ch[chi].rx_ip = true;
+                }
+            }
         }
     }
 

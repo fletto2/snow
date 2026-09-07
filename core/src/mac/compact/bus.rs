@@ -771,6 +771,11 @@ where
 
             self.cycles += ticks;
 
+            // Serial receive is clocked in at the line rate, one byte per ten
+            // bit times, rather than appearing whole the instant a host writes
+            // it.  See Scc::tick_rx.
+            self.scc.tick_rx(ticks);
+
             self.eclock += ticks;
             while self.eclock >= 10 {
                 // The E Clock is roughly 1/10th of the CPU clock

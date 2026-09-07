@@ -22,6 +22,21 @@ const SHIFT_DELAY: Ticks = ONESEC_TICKS * 3 / 1000;
 /// paces it at the real-hardware rate its own watchdog dictates.
 const INQUIRY_HOLD: Ticks = ONESEC_TICKS / 4;
 
+/// Env-gated keyboard/shift-register trace (SNOW_KBD_TRACE=1).
+///
+/// Added to settle macrom issues.md #175: a phantom `c` reaching the guest,
+/// which decodes to raw $10 -- the Inquiry command byte the ROM itself wrote
+/// to this register. The question the trace answers is whether the guest reads
+/// SR back while it still holds that command, and what the ACR mode was when
+/// it did.
+fn kbdtrace(what: &str, a: u8, b: u8) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("SNOW_KBD_TRACE").is_ok()) {
+        eprintln!("[KBD] {what} {a:#04x} {b:#04x}");
+    }
+}
+
 const ACR_SHIFT_OUT: u8 = 0b111;
 const ACR_SHIFT_IN: u8 = 0b011;
 
@@ -358,6 +373,7 @@ impl BusMember<Address> for Via {
             // Shift register
             0x0A => {
                 let sr = self.sr;
+                kbdtrace("SR-read  val/acrmode", sr, self.acr.kbd());
                 self.ifr.set_kbdready(false);
 
                 Some(sr)
@@ -453,6 +469,7 @@ impl BusMember<Address> for Via {
             0x0A => {
                 self.ifr.set_kbdready(false);
 
+                kbdtrace("SR-write val/acrmode", val, self.acr.kbd());
                 self.sr = val;
                 if self.acr.kbd() == ACR_SHIFT_OUT {
                     // Start shift-out
@@ -494,6 +511,7 @@ impl BusMember<Address> for Via {
             0x0B => {
                 let newacr = RegisterACR(val);
                 if newacr.kbd() != self.acr.kbd() {
+                    kbdtrace("ACR-mode old/new", self.acr.kbd(), newacr.kbd());
                     // Reset shifter operation
                     self.kbdshift_in_time = 0;
                     self.kbdshift_out_time = 0;
@@ -638,6 +656,7 @@ impl Tickable for Via {
                 } else {
                     self.adb.data_in(self.kbdshift_out);
                 }
+                kbdtrace("OUT-done  cmd/sr", self.kbdshift_out, self.sr);
                 self.ifr.set_kbdready(true);
             }
         }
@@ -664,6 +683,7 @@ impl Tickable for Via {
                         }
                     }
                 }
+                kbdtrace("IN-done   byte/acrmode", self.kbdshift_in, self.acr.kbd());
                 self.sr = self.kbdshift_in;
                 self.ifr.set_kbdready(true);
                 self.kbdshift_in = self.sr;
