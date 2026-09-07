@@ -223,6 +223,8 @@ pub struct SnowGui {
     confirm_dialog: ConfirmDialog,
     pending_confirm: PendingConfirm,
     ui_active: bool,
+    /// SNOW_KBD_FILE: headless scancode injection, see poll_injected_keys.
+    kbd_inject_path: Option<String>,
     last_running: bool,
 
     // Snowflakes
@@ -471,6 +473,7 @@ impl SnowGui {
             confirm_dialog: ConfirmDialog::new(),
             pending_confirm: PendingConfirm::None,
             ui_active: true,
+            kbd_inject_path: std::env::var("SNOW_KBD_FILE").ok(),
             last_running: false,
 
             // Snowflakes
@@ -2312,7 +2315,59 @@ impl SnowGui {
         false
     }
 
+    /// Headless key injection: SNOW_KBD_FILE names a file of scancodes.
+    ///
+    /// Keyboard input normally arrives as winit events, which need a focused
+    /// window.  Under Xvfb with no window manager there is nothing to give the
+    /// window focus, so XTEST keystrokes reach the X server and go nowhere --
+    /// which leaves every guest keyboard path untestable from a script, and
+    /// those are exactly the paths that cannot be driven over a serial console:
+    /// a program reading /dev/kbd, macmon's CRT patterns waiting for a key, an
+    /// M0110 decode.
+    ///
+    /// The file holds whitespace-separated tokens: `+HH` presses scancode HH,
+    /// `-HH` releases it, and a bare `HH` does both.  RAW SCANCODES rather than
+    /// key names on purpose -- update_key takes a scancode, so a name table
+    /// here would be a second mapping to keep in step with keymap.rs, and the
+    /// scancode is what the guest's driver actually decodes.  The file is
+    /// truncated once read, so a writer just appends and waits.
+    ///
+    /// Deliberately OUTSIDE the ui_active and wants_keyboard_input gates that
+    /// guard the winit path: this is a test hook, and making it depend on
+    /// window focus would defeat the only reason it exists.
+    fn poll_injected_keys(&mut self) {
+        let Some(path) = self.kbd_inject_path.as_ref() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let _ = std::fs::write(path, "");
+        for tok in text.split_whitespace() {
+            let (down, up, hex) = match tok.as_bytes().first() {
+                Some(b'+') => (true, false, &tok[1..]),
+                Some(b'-') => (false, true, &tok[1..]),
+                _ => (true, true, tok),
+            };
+            let Ok(sc) = u8::from_str_radix(hex, 16) else {
+                log::warn!("SNOW_KBD_FILE: bad token {:?}", tok);
+                continue;
+            };
+            if down {
+                self.emu.update_key(sc, true);
+            }
+            if up {
+                self.emu.update_key(sc, false);
+            }
+        }
+    }
+
     fn poll_winit_events(&mut self, ctx: &egui::Context) {
+        self.poll_injected_keys();
+
         if self.wev_recv.is_empty() {
             return;
         }
