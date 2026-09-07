@@ -650,7 +650,7 @@ fn dispatch(d: &mut Dev, faults: &Faults) -> bool {
                     if d.data_size < 32 {
                         return false;
                     }
-                    let rec = slot_record(sl);
+                    let rec = slot_record(sl, d.size);
                     d.data_write(0, &rec);
                     true
                 }
@@ -662,14 +662,27 @@ fn dispatch(d: &mut Dev, faults: &Faults) -> bool {
                     let pre = [total, whole, 32u8, 0u8];
                     d.data_write(0, &pre);
                     for s in 0..whole as usize {
-                        let rec = slot_record(s);
+                        let rec = slot_record(s, d.size);
                         d.data_write(4 + (s as u32) * 32, &rec);
                     }
                     true
                 }
                 0x03 => {
-                    // RAM_SLOT_INFO_ALL: count then which one is active
-                    let info = [d.nram as u8, d.active_slot as u8];
+                    // RAM_SLOT_INFO_ALL: total, active, TYPE, 0.
+                    //
+                    // Offset 2 was left out of this port and read back as
+                    // whatever the back-channel still held -- zero, which the
+                    // type table reads as a 2 KB part. A host checks the size
+                    // it was configured with against this byte, so a 64 KB
+                    // device claiming 2 KB is refused before any write, which
+                    // is what romsel did. The byte has to name the part the
+                    // slot actually serves.
+                    let info = [
+                        d.nram as u8,
+                        d.active_slot as u8,
+                        rom_type_for(d.size),
+                        0u8,
+                    ];
                     d.data_write(0, &info);
                     true
                 }
@@ -856,18 +869,44 @@ fn dispatch(d: &mut Dev, faults: &Faults) -> bool {
     }
 }
 
-/// A 32-byte flash slot record: ROM type, then a NUL-padded name from byte 8.
-fn slot_record(slot: usize) -> [u8; 32] {
+/// The ROM-type byte a device of this size must report.
+///
+/// It was hardcoded to 0x1C (28C256, 32 KB) while the model served 64 KB per
+/// device, and romsel caught it: the type byte is what a host checks its
+/// configured size against, so a device claiming a part half its own size is
+/// refused before any write ("The device serves a different size than -s
+/// says").  That refusal was correct, which is the point -- the guard exists
+/// because a size taken on trust writes a partial image into every device and
+/// reports success.  0xFF is the protocol's "no opinion", which leaves the
+/// host's figure standing rather than contradicting it.
+fn rom_type_for(size: u32) -> u8 {
+    match size {
+        2048 => 0x1A,   // 28C16
+        8192 => 0x1B,   // 28C64
+        32768 => 0x1C,  // 28C256
+        65536 => 0x1D,  // 28C512
+        _ => 0xFF,
+    }
+}
+
+/// A 32-byte flash slot record: ROM type at 0, then a NUL-padded name.
+///
+/// The name starts at byte 1, not byte 8. This port put it at 8 and MacGrub
+/// read it from 8, so the two agreed with each other and disagreed with the
+/// device: romsel, which is the host written against real silicon, reads
+/// byte 1 and duly showed every slot as "(unnamed)". A model that only ever
+/// talks to the host built alongside it proves nothing.
+fn slot_record(slot: usize, size: u32) -> [u8; 32] {
     let mut rec = [0u8; 32];
-    rec[0] = 0x1C; // 28C256
+    rec[0] = rom_type_for(size);
     let name: &[u8] = match slot {
         0 => b"macmon",
         1 => b"Macintosh Plus ROM",
         2 => b"MacGrub",
         _ => b"slot",
     };
-    let n = name.len().min(23);
-    rec[8..8 + n].copy_from_slice(&name[..n]);
+    let n = name.len().min(31);
+    rec[1..1 + n].copy_from_slice(&name[..n]);
     rec
 }
 
