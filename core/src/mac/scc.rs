@@ -283,6 +283,16 @@ struct SccChannel {
     rx_pending: VecDeque<u8>,
     /// CPU cycles accumulated toward the next byte's arrival.
     rx_cycles: Ticks,
+    /// CPU cycles left before the transmit buffer is empty again.
+    ///
+    /// RR0's tx_empty was hardwired true, so a guest never waited: macmon's
+    /// ROM walk put 9591 bytes on the wire in 5 s, about 1900 B/s, where 9600
+    /// 8N1 carries 960.  Receive was paced and transmit was not, which made
+    /// "the emulator now has faithful serial timing" only half true -- and the
+    /// half that was wrong is the one that decides how much time a guest
+    /// spends inside its output loop, which is exactly what an interrupt-
+    /// timing bug is sensitive to.
+    tx_cycles: Ticks,
 
     /// SDLC station address (WR6) - used for LocalTalk node address
     sdlc_address: u8,
@@ -396,6 +406,11 @@ impl Scc {
             self.ch[chi].tx_ip = true;
         }
 
+        // The byte occupies the shifter for one character time.  RR0 reports
+        // the buffer busy until then, which is what makes a polling writer
+        // wait the way it does on the wire.
+        self.ch[chi].tx_cycles = self.tx_cycles_per_byte(chi);
+
         // Always push to tx_queue for the byte-stream path (try_extract_packets)
         self.ch[chi].tx_queue.push_back(val);
 
@@ -498,7 +513,7 @@ impl Scc {
         let result = match (self.reg, ch) {
             (0 | 4, _) => *RdReg0::default()
                 .with_rx_char(rx_char_avail)
-                .with_tx_empty(true)
+                .with_tx_empty(self.ch[chi].tx_cycles == 0)
                 .with_tx_underrun(true)
                 .with_sync_hunt(self.ch[chi].hunt)
                 .with_dcd(self.ch[chi].dcd),
@@ -824,8 +839,20 @@ impl Scc {
         (CPU_HZ * bits / (baud as Ticks)).max(1)
     }
 
-    /// Clock pending receive bytes in at the line rate.
+    /// Character time for the transmitter; same arithmetic as receive.
+    fn tx_cycles_per_byte(&self, chi: usize) -> Ticks {
+        self.rx_cycles_per_byte(chi)
+    }
+
+    /// Clock pending receive bytes in at the line rate, and retire the
+    /// transmit byte currently in the shifter.
     pub fn tick_rx(&mut self, ticks: Ticks) {
+        for chi in 0..2 {
+            if self.ch[chi].tx_cycles > 0 {
+                self.ch[chi].tx_cycles = self.ch[chi].tx_cycles.saturating_sub(ticks);
+            }
+        }
+
         for chi in 0..2 {
             if self.ch[chi].rx_pending.is_empty() {
                 self.ch[chi].rx_cycles = 0;
