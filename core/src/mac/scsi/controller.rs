@@ -211,6 +211,30 @@ pub struct ScsiController {
     /// direction has been armed.
     dma_armed: bool,
 
+    /// OUTPUT-REGISTER LATCH for DMA Send, opt-in via SNOW_SCSI_OUTLATCH=1.
+    ///
+    /// On a real 5380 a byte written for a DMA Send lands in the output data
+    /// register and only leaves over the REQ/ACK handshake a moment later.  The
+    /// datasheet is explicit (section 8.2): "For send operations, the END OF
+    /// DMA bit is set when the DMA finishes its transfer, but the SCSI transfer
+    /// may still be in progress ... both REQ and ACK must be sampled to
+    /// determine when the last byte was transferred."  Apple's own SCSI Manager
+    /// obeys this: every WRITE loop in the Plus ROM ends with a DRQ wait at
+    /// $41744E and every READ loop branches past it.
+    ///
+    /// Snow transferred the byte instantly on the ODR write, so a driver that
+    /// cleared MR immediately after its last `move.b` still got perfect data
+    /// here and silently lost that byte on real hardware -- exactly the failure
+    /// class of issues_unix.md #16, which no emulator run could reproduce.
+    ///
+    /// With this enabled the byte waits in `out_latch` until the chip is next
+    /// OBSERVED (a BSR or CSR read, which is what a drain does) or until the
+    /// next byte is written.  Clearing DMA mode with a byte still latched
+    /// DROPS it, which is the hardware behaviour the drain exists to avoid.
+    out_latch: Option<u8>,
+    out_latch_enabled: bool,
+    out_latch_dropped: usize,
+
     /// Selected SCSI ID
     sel_id: usize,
 
@@ -301,6 +325,11 @@ impl ScsiController {
             reg_odr: 0,
             reg_selen: 0,
             dma_armed: false,
+            out_latch: None,
+            out_latch_enabled: std::env::var("SNOW_SCSI_OUTLATCH")
+                .map(|v| v != "0")
+                .unwrap_or(false),
+            out_latch_dropped: 0,
             sel_id: 0,
             sel_atn: false,
             cmdbuf: vec![],
@@ -628,18 +657,41 @@ impl ScsiController {
         self.write_datareg(val);
     }
 
-    fn write_datareg(&mut self, val: u8) {
-        self.reg_odr = val;
+    /// Push a byte sitting in the output register out over REQ/ACK.
+    ///
+    /// Called when the driver next OBSERVES the chip (a BSR or CSR read) or
+    /// writes the following byte.  Modelling it this way is what makes the
+    /// missing-drain bug reproducible: a driver that tears DMA mode down
+    /// without ever looking at the chip again never gets here.
+    fn flush_out_latch(&mut self) {
+        if let Some(b) = self.out_latch.take() {
+            self.reg_odr = b;
+            self.assert_ack();
+            self.deassert_ack();
+        }
+    }
 
+    fn write_datareg(&mut self, val: u8) {
         // Pseudo-DMA path: writes to the DMA window auto-pulse ACK, so we
         // advance the REQ/ACK handshake here instead of waiting for an
         // explicit ICR ACK toggle.
         if self.dma_armed && matches!(self.busphase, ScsiBusPhase::DataOut | ScsiBusPhase::Command)
         {
+            if self.out_latch_enabled && matches!(self.busphase, ScsiBusPhase::DataOut) {
+                // The previous byte has had a whole bus cycle to go out; this
+                // one takes its place in the output register.
+                self.flush_out_latch();
+                self.reg_odr = val;
+                self.out_latch = Some(val);
+                return;
+            }
+            self.reg_odr = val;
             self.assert_ack();
             self.deassert_ack();
             return;
         }
+
+        self.reg_odr = val;
 
         // Legacy PIO DataOut: the byte is transferred (pushed into responsebuf)
         // by the REQ/ACK handshake -- specifically deassert_ack() when the driver
@@ -782,6 +834,8 @@ impl BusMember<Address> for ScsiController {
             NcrReadReg::ICR => Some(self.reg_icr.0),
             NcrReadReg::TCR => Some(self.reg_tcr.0),
             NcrReadReg::CSR => {
+                // Reading the chip gives a latched send byte its bus cycle.
+                self.flush_out_latch();
                 let val = self.reg_csr.0;
 
                 // MacII has a race condition where it will get stuck if
@@ -792,19 +846,24 @@ impl BusMember<Address> for ScsiController {
 
                 Some(val)
             }
-            NcrReadReg::BSR => Some(
-                self.reg_bsr
-                    .with_dma_req(self.get_drq())
-                    .with_dma_end(
-                        self.reg_mr.dma_mode()
-                            && !matches!(
-                                self.busphase,
-                                ScsiBusPhase::DataIn | ScsiBusPhase::DataOut,
-                            ),
-                    )
-                    .with_phase_match(self.phase_match())
-                    .0,
-            ),
+            NcrReadReg::BSR => {
+                // Same: a DRQ poll is an observation, and is exactly what
+                // Apple's write drain at $41744E does.
+                self.flush_out_latch();
+                Some(
+                    self.reg_bsr
+                        .with_dma_req(self.get_drq())
+                        .with_dma_end(
+                            self.reg_mr.dma_mode()
+                                && !matches!(
+                                    self.busphase,
+                                    ScsiBusPhase::DataIn | ScsiBusPhase::DataOut,
+                                ),
+                        )
+                        .with_phase_match(self.phase_match())
+                        .0,
+                )
+            }
             NcrReadReg::RESET => {
                 if self.scsi_trace_irq && self.reg_bsr.irq() {
                     debug!("SCSI IRQ cleared (RESET register read)");
@@ -884,6 +943,22 @@ impl BusMember<Address> for ScsiController {
 
                 // Leaving DMA mode disarms any pending DMA direction.
                 if clr.dma_mode() {
+                    // THE BYTE STILL IN THE OUTPUT REGISTER IS LOST.
+                    //
+                    // This is the whole point of the model: a driver that
+                    // clears MR right after its final `move.b`, without
+                    // waiting for the handshake, abandons that byte.  Real
+                    // hardware does this silently and the data on the disk is
+                    // wrong by one byte per transfer.
+                    if self.out_latch.take().is_some() {
+                        self.out_latch_dropped += 1;
+                        log::warn!(
+                            "SCSI: DMA-send byte LOST -- DMA mode cleared with a byte \
+                             still in the output register (drop #{}).  The driver did \
+                             not drain before teardown; see the 5380 datasheet 8.2.",
+                            self.out_latch_dropped
+                        );
+                    }
                     self.dma_armed = false;
                 }
                 Some(())
