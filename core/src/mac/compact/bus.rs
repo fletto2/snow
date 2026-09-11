@@ -50,7 +50,7 @@ pub struct CompactMacBus<TRenderer: Renderer> {
     /// RAM pages (RAM_DIRTY_PAGESIZE bytes) written
     pub(crate) ram_dirty: BitSet,
 
-    /// Optional DRAM row decay model (off unless SNOW_DRAM_DECAY=1). Models the
+    /// DRAM row decay model (ON by default, SNOW_DRAM_DECAY=0 disables). Models the
     /// fact that video refresh sweeps only RA0..RA8, so on a 1M-chip board the
     /// RA9 (= A19) half of the array is refreshed by CPU accesses alone.
     #[serde(skip)]

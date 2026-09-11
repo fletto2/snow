@@ -62,13 +62,29 @@ pub struct DramDecay {
 }
 
 impl DramDecay {
-    /// Builds the model from the environment, or returns None if not enabled.
+    /// Builds the model from the environment, or returns None if disabled.
     ///
-    /// * `SNOW_DRAM_DECAY=1`         - enable
+    /// * `SNOW_DRAM_DECAY=0`         - DISABLE (on by default since 2026-09-11)
     /// * `SNOW_DRAM_DECAY_FRAMES=60` - frames without refresh before decay
     /// * `SNOW_DRAM_DECAY_ODDS=4`    - 1-in-N chance per frame per stale row
+    ///
+    /// ON BY DEFAULT, because a real Mac Plus does this and an emulator that
+    /// does not is silently more forgiving than the machine it stands in for.
+    /// The model was opt-in when it was new and unproven.  Leaving it opt-in
+    /// meant every test in every downstream project ran on RAM that never
+    /// decays, so a change that starves the software refresh sweep passes
+    /// cleanly here and rots memory on the real board -- and on a 1M-chip
+    /// board (2/2.5/4 MB) video CANNOT refresh the RA9-static half, so the
+    /// sweep is the only thing keeping that half alive.  That failure mode is
+    /// invisible, lands on the boards that are already marginal, and is
+    /// exactly what an emulator is for.  Default-on turns it into a test
+    /// result instead of a field report.
+    ///
+    /// Set SNOW_DRAM_DECAY=0 to get the old behavior for a run that genuinely
+    /// wants perfect memory (bisecting an unrelated fault, say).
     pub fn from_env(ram_size: usize) -> Option<Self> {
-        if std::env::var("SNOW_DRAM_DECAY").ok().as_deref() != Some("1") {
+        if std::env::var("SNOW_DRAM_DECAY").ok().as_deref() == Some("0") {
+            log::warn!("DRAM decay model DISABLED by SNOW_DRAM_DECAY=0");
             return None;
         }
         let env_num = |k: &str, d: u32| {
@@ -82,7 +98,24 @@ impl DramDecay {
         let s = Self {
             last_refresh: vec![0; TOTAL_ROWS],
             frame: 0,
-            retention_frames: env_num("SNOW_DRAM_DECAY_FRAMES", 60),
+            // 240 frames = 4 s.  THIS DEFAULT IS PINNED TO A PROVEN MACHINE,
+            // not picked to make tests pass.  POSiniX runs reliably on a real
+            // 4 MB Plus, and its software sweep (dram_refresh_gentle, one
+            // 16-byte slice per reschedule, 128 slices per pass) cannot
+            // revisit a row faster than ~2.1 s at 60 Hz idle reschedules and
+            // ~2.6 s under load.  So real retention on that board EXCEEDS
+            // 2.6 s, and a model that calls a row stale after 1 s is stricter
+            // than the hardware it stands in for -- at 60 frames every
+            // userland test fails, which is the model being wrong, not the OS.
+            // 4 s clears the proven pass with margin while still catching a
+            // refresh that has been starved into the 10 s range (which is what
+            // raising the SCSI chunk cap to 32 KB would do).
+            //
+            // A test that WANTS the aggressive setting asks for it: the #171
+            // march 2x2 needs a row to rot within the ~0.5-1 s the march
+            // leaves an A19 half untouched, so it passes
+            // SNOW_DRAM_DECAY_FRAMES=60 explicitly.
+            retention_frames: env_num("SNOW_DRAM_DECAY_FRAMES", 240),
             decay_odds: env_num("SNOW_DRAM_DECAY_ODDS", 4),
             ra9_is_row_bit,
             // Fixed seed: weak cells leak the same way every run on real
