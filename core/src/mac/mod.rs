@@ -24,6 +24,7 @@ pub mod scsi;
 pub mod serial_bridge;
 pub mod swim;
 pub mod via;
+pub mod via_common;
 
 /// Differentiation of Macintosh models and their features
 #[derive(
@@ -294,9 +295,19 @@ impl MacModel {
                 // Mac Classic has a pulldown (R79) as model identifier
                 via::RegisterA(0xFF).with_sndpg2(false)
             }
-            Self::MacII | Self::MacIIFDHD => via::RegisterA(0).with_model(1),
-            Self::MacIIx => via::RegisterA(0).with_model(0),
-            Self::MacIIcx | Self::SE30 => via::RegisterA(0).with_model(0x03).with_model6(true),
+            // The ROM identifies the model from PA6 and PB3 of VIA2:
+            //
+            //   PA6  PB3
+            //    0    0   Macintosh IIx
+            //    0    1   Macintosh II
+            //    1    0   Macintosh SE/30
+            //    1    1   Macintosh IIcx
+            //
+            // PA0-PA2 go to the burn-in connector and are pulled up. The ROM
+            // detects the burn-in fixture by toggling PA0 and checking whether
+            // PA1 follows.
+            Self::MacII | Self::MacIIFDHD | Self::MacIIx => via::RegisterA(0xFF).with_model6(false),
+            Self::MacIIcx | Self::SE30 => via::RegisterA(0xFF),
         }
     }
 
@@ -471,6 +482,8 @@ pub enum MacMonitor {
     RGB21,
     /// Macintosh 15" Portrait monitor (640x870, B&W)
     PortraitBW,
+    /// Macintosh 21" Two-Page monitor (1152x870, B&W)
+    TwoPageBW,
 }
 
 impl Display for MacMonitor {
@@ -484,6 +497,7 @@ impl Display for MacMonitor {
                 Self::RGB16 => "Macintosh 16\" RGB monitor",
                 Self::RGB21 => "Macintosh 21\" RGB monitor",
                 Self::PortraitBW => "Macintosh 15\" Portrait monitor",
+                Self::TwoPageBW => "Macintosh 21\" Two-Page monitor",
             },
             self.width(),
             self.height()
@@ -496,9 +510,12 @@ impl MacMonitor {
         match self {
             Self::RGB12 => [2, 2, 0, 2],
             Self::HiRes14 => [6, 2, 4, 6],
+            /* RGB15 => [5, 1, 0, 1] according to TN HW30, detected as RGB16 */
             Self::RGB16 => [7, 2, 5, 2],
+            /* RGB19 => [7, 3, 4, 4] according to TN HW30, not detected */
             Self::RGB21 => [0, 0, 0, 0],
             Self::PortraitBW => [1, 1, 1, 0],
+            Self::TwoPageBW => [3, 1, 0, 0],
         }
     }
 
@@ -509,6 +526,7 @@ impl MacMonitor {
             Self::RGB16 => 832,
             Self::RGB21 => 1152,
             Self::PortraitBW => 640,
+            Self::TwoPageBW => 1152,
         }
     }
 
@@ -519,13 +537,14 @@ impl MacMonitor {
             Self::RGB16 => 624,
             Self::RGB21 => 870,
             Self::PortraitBW => 870,
+            Self::TwoPageBW => 870,
         }
     }
 
     pub fn has_color(self) -> bool {
         match self {
             Self::RGB12 | Self::HiRes14 | Self::RGB16 | Self::RGB21 => true,
-            Self::PortraitBW => false,
+            Self::PortraitBW | Self::TwoPageBW => false,
         }
     }
 }

@@ -150,6 +150,35 @@ impl Swim {
     /// ISM CRC initialization value
     pub(super) const ISM_CRC_INIT: u16 = 0xcdb4;
 
+    /// The last four bytes of the parameter RAM, all of it on the SWIM2, are
+    /// LATE/NORMAL, TIME0, EARLY/NORMAL and TIME1. NORMAL is a single nibble,
+    /// written through LATE and read through both (SWIM Chip User's
+    /// Reference, Quadra 700 POST). The SWIM2 has no NORMAL and ignores the
+    /// low nibble of LATE and EARLY (SWIM2 ERS), read as 0 here.
+    fn ism_param_read(&mut self) -> u8 {
+        let idx = self.ism_param_idx;
+        let late = self.ism_params.len() - 4;
+        let early = self.ism_params.len() - 2;
+        self.ism_param_idx = (idx + 1) % self.ism_params.len();
+        if idx == early {
+            (self.ism_params[early] & 0xF0) | (self.ism_params[late] & 0x0F)
+        } else {
+            self.ism_params[idx]
+        }
+    }
+
+    fn ism_param_write(&mut self, value: u8) {
+        let idx = self.ism_param_idx;
+        let late = self.ism_params.len() - 4;
+        let early = self.ism_params.len() - 2;
+        self.ism_param_idx = (idx + 1) % self.ism_params.len();
+        self.ism_params[idx] = if idx == early || (idx == late && !self.iwm_available) {
+            value & 0xF0
+        } else {
+            value
+        };
+    }
+
     /// Update CRC with a single bit
     fn ism_crc_update(&mut self, bit: bool) {
         if (self.ism_crc ^ (if bit { 0x8000 } else { 0x0000 })) & 0x8000 != 0 {
@@ -259,7 +288,8 @@ impl Swim {
                             ))
                             .with_crc_error(!last_entry.crc_valid())
                             .with_sense(
-                                !self.get_selected_drive().is_present()
+                                !self.ism_drive_enabled()
+                                    || !self.get_selected_drive().is_present()
                                     || self
                                         .get_selected_drive()
                                         .read_sense(self.get_selected_drive_reg_u8()),
@@ -283,11 +313,7 @@ impl Swim {
                             .0,
                     )
                 }
-                IsmRegister::Parameter => {
-                    let value = self.ism_params[self.ism_param_idx];
-                    self.ism_param_idx = (self.ism_param_idx + 1) % self.ism_params.len();
-                    Some(value)
-                }
+                IsmRegister::Parameter => Some(self.ism_param_read()),
                 IsmRegister::Setup => Some(self.ism_setup.0),
                 _ => {
                     warn!("Unimplemented read {:?}", reg);
@@ -336,6 +362,13 @@ impl Swim {
                 IsmRegister::ModeZero => {
                     self.ism_param_idx = 0;
 
+                    // Without an IWM register set, the ISM one stays selected
+                    let value = if self.iwm_available {
+                        value
+                    } else {
+                        IsmStatus(value).with_ism(false).0
+                    };
+
                     let clr = IsmStatus(value & self.ism_mode.0);
                     if clr.clear_fifo() {
                         self.ism_fifo.clear();
@@ -365,10 +398,7 @@ impl Swim {
                     }
                     self.ism_mode.0 |= value;
                 }
-                IsmRegister::Parameter => {
-                    self.ism_params[self.ism_param_idx] = value;
-                    self.ism_param_idx = (self.ism_param_idx + 1) % self.ism_params.len();
-                }
+                IsmRegister::Parameter => self.ism_param_write(value),
                 IsmRegister::Setup => {
                     self.ism_setup.0 = value;
                 }
@@ -387,6 +417,11 @@ impl Swim {
         } else {
             error!("Unknown ISM register write {:04X}", offset);
         }
+    }
+
+    /// One of the drive enable lines is asserted
+    fn ism_drive_enabled(&self) -> bool {
+        self.ism_mode.drive1_enable() || self.ism_mode.drive2_enable()
     }
 
     fn ism_read_phases(&self) -> u8 {
@@ -413,7 +448,7 @@ impl Swim {
         self.ca0 = outputs & (1 << 0) != 0;
         self.ca1 = outputs & (1 << 1) != 0;
         self.ca2 = outputs & (1 << 2) != 0;
-        if !self.lstrb && outputs & (1 << 3) != 0 {
+        if !self.lstrb && outputs & (1 << 3) != 0 && self.ism_drive_enabled() {
             // Write strobe
             let reg = self.get_selected_drive_reg_u8();
             let cycles = self.cycles;
@@ -424,12 +459,15 @@ impl Swim {
 
     pub(super) fn ism_tick(&mut self, ticks: Ticks) -> Result<()> {
         self.bit_cycles += ticks;
-        if self.bit_cycles < self.get_selected_drive().get_ticks_per_bit() {
-            return Ok(());
+        while self.bit_cycles >= self.get_selected_drive().get_ticks_per_bit() {
+            self.bit_cycles -= self.get_selected_drive().get_ticks_per_bit();
+            self.ism_tick_bit()?;
         }
+        Ok(())
+    }
 
-        self.bit_cycles -= self.get_selected_drive().get_ticks_per_bit();
-
+    /// Moves the head over one bit cell
+    fn ism_tick_bit(&mut self) -> Result<()> {
         if self.get_selected_drive().floppy.get_track_type(
             self.get_active_head(),
             self.get_selected_drive().get_active_track(),
@@ -459,6 +497,22 @@ impl Swim {
         }
 
         // Read mode
+        if self.ism_setup.gcr() {
+            // A byte is complete when its most significant bit is set
+            if self.ism_shreg & 0x80 != 0 {
+                self.ism_fifo.push_back(IsmFifoEntry::Data {
+                    value: self.ism_shreg as u8,
+                    crc_valid: false,
+                });
+                if self.ism_fifo.len() > 2 {
+                    self.ism_error.set_underrun(true);
+                    self.ism_fifo.pop_front();
+                }
+                self.ism_shreg = 0;
+            }
+            return Ok(());
+        }
+
         if !self.ism_synced && self.ism_shreg == Self::MFM_SYNC_MARKER {
             // Synchronized to the markers now, get ready to clock out bytes
             self.ism_shreg_cnt = 0;
@@ -501,6 +555,26 @@ impl Swim {
         Ok(())
     }
 
+    /// The bytes of the FIFO get shifted out without a spinning disk too.
+    /// They take 16 microseconds each here, whatever the setup and the
+    /// parameters are.
+    pub(super) fn ism_tick_no_disk(&mut self, ticks: Ticks) {
+        if !self.ism_mode.action() || !self.ism_mode.write() {
+            return;
+        }
+
+        let byte_ticks = self.get_selected_drive().base_frequency * 16 / 1_000_000;
+        self.bit_cycles += ticks;
+        while self.bit_cycles >= byte_ticks && self.ism_mode.action() {
+            self.bit_cycles -= byte_ticks;
+
+            if self.ism_fifo.pop_front().is_none() {
+                self.ism_error.set_underrun(true);
+                self.ism_mode.set_action(false);
+            }
+        }
+    }
+
     /// Handle ISM write mode tick
     fn ism_tick_write(&mut self) -> Result<()> {
         let head = self.get_active_head();
@@ -521,6 +595,11 @@ impl Swim {
             //);
 
             match entry {
+                entry if self.ism_setup.tsm_disable() => {
+                    // GCR, the bytes are written as they are
+                    self.ism_write_shreg = u16::from(entry.inner()) << 8;
+                    self.ism_write_shreg_cnt = 8;
+                }
                 IsmFifoEntry::Marker(data) => {
                     // Markers use pre-encoded sync pattern (0xA1 with missing clock)
                     // Reset CRC when marker is encountered
@@ -578,5 +657,242 @@ impl Swim {
         self.ism_write_shreg_cnt -= 1;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use snow_floppy::{FloppyImage, FloppyType};
+
+    use super::*;
+    use crate::bus::BusMember;
+    use crate::mac::swim::drive::DriveType;
+    use crate::tickable::Tickable;
+
+    const REG_DATA: Address = 0;
+    const REG_ERROR: Address = 2;
+    const REG_PARAM: Address = 3;
+    const REG_PHASES: Address = 4;
+    const REG_SETUP: Address = 5;
+    const REG_MODE_ZERO: Address = 6;
+    const REG_MODE_ONE: Address = 7;
+    const REG_STATUS: Address = 6;
+    const REG_HANDSHAKE: Address = 7;
+
+    const MODE_CLEAR_FIFO: u8 = 0x01;
+    const MODE_DRIVE1: u8 = 0x02;
+    const MODE_MOTOR: u8 = 0x80;
+    const MODE_ACTION: u8 = 0x08;
+    const MODE_WRITE: u8 = 0x10;
+
+    const DRIVE_MOTOR_ON: u8 = 0b0100;
+
+    /// CA1 high: motor on with SEL low, low when it is
+    const PHASES_MOTOR_ON: u8 = 0xF2;
+
+    /// CA0, CA1 and CA2 high, LSTRB low then high: eject with SEL low
+    const PHASES_EJECT: [u8; 2] = [0xF7, 0xFF];
+
+    fn reg(reg: Address) -> Address {
+        reg << 9
+    }
+
+    /// SWIM in ISM mode, a disk spinning in the first drive
+    fn swim(setup: u8) -> Swim {
+        let mut swim = Swim::new(&[DriveType::SuperDrive], true, 16_000_000);
+        swim.disk_insert(0, FloppyImage::new(FloppyType::Mac800K, ""))
+            .unwrap();
+        swim.drives[0].write_drive_reg(DRIVE_MOTOR_ON, 0);
+        swim.drives[0].not_ready = 0;
+
+        // Q6 on, then the sequence on the mode register
+        swim.write(reg(13), 0);
+        for val in [0x57, 0x17, 0x57, 0x57] {
+            swim.write(reg(15), val);
+        }
+        assert_eq!(swim.mode, SwimMode::Ism);
+
+        swim.write(reg(REG_SETUP), setup);
+        swim.write(reg(REG_MODE_ONE), MODE_DRIVE1);
+        swim
+    }
+
+    fn start(swim: &mut Swim, mode: u8) {
+        swim.write(reg(REG_MODE_ZERO), MODE_WRITE | MODE_ACTION);
+        swim.write(reg(REG_MODE_ONE), mode);
+        swim.write(reg(REG_MODE_ONE), MODE_CLEAR_FIFO);
+        swim.write(reg(REG_MODE_ZERO), MODE_CLEAR_FIFO);
+        swim.read(reg(REG_ERROR));
+    }
+
+    fn tick_bit(swim: &mut Swim) {
+        let ticks = swim.drives[0].get_ticks_per_bit();
+        swim.tick(ticks, ()).unwrap();
+    }
+
+    #[test]
+    fn gcr_write_read() {
+        const DATA: [u8; 8] = [0xFF, 0xD5, 0xAA, 0x96, 0x9A, 0xB3, 0xDE, 0xAA];
+
+        let mut swim = swim(0x44);
+        let position = swim.drives[0].track_position;
+
+        start(&mut swim, MODE_WRITE);
+        let mut data = DATA.iter();
+        swim.write(reg(REG_DATA), *data.next().unwrap());
+        swim.write(reg(REG_MODE_ONE), MODE_ACTION);
+        while swim.ism_mode.action() {
+            if swim.read(reg(REG_HANDSHAKE)).unwrap() & 0x80 != 0
+                && let Some(val) = data.next()
+            {
+                swim.write(reg(REG_DATA), *val);
+            }
+            tick_bit(&mut swim);
+        }
+        // The write ends when the FIFO runs empty
+        assert_eq!(swim.read(reg(REG_ERROR)), Some(0x01));
+        assert_eq!(swim.drives[0].track_position, position + DATA.len() * 8 + 1);
+
+        swim.drives[0].track_position = position;
+        start(&mut swim, 0);
+        swim.write(reg(REG_MODE_ONE), MODE_ACTION);
+        let mut read = vec![];
+        while read.len() < DATA.len() {
+            tick_bit(&mut swim);
+            if swim.read(reg(REG_HANDSHAKE)).unwrap() & 0x80 != 0 {
+                read.push(swim.read(reg(REG_DATA)).unwrap());
+            }
+        }
+        assert_eq!(read, DATA);
+        assert_eq!(swim.read(reg(REG_ERROR)), Some(0x00));
+    }
+
+    #[test]
+    fn gcr_read_overrun() {
+        let mut swim = swim(0x44);
+        start(&mut swim, 0);
+        swim.write(reg(REG_MODE_ONE), MODE_ACTION);
+        // Nothing reads the FIFO
+        for _ in 0..100 {
+            tick_bit(&mut swim);
+        }
+        assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0xE0, 0xE0);
+        assert_eq!(swim.read(reg(REG_ERROR)), Some(0x01));
+    }
+
+    fn params(swim: &mut Swim, vals: &[u8], count: usize) -> Vec<u8> {
+        swim.write(reg(REG_MODE_ZERO), 0);
+        for &val in vals {
+            swim.write(reg(REG_PARAM), val);
+        }
+        (0..count)
+            .map(|_| swim.read(reg(REG_PARAM)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn swim_params() {
+        let mut swim = swim(0x20);
+        let vals: Vec<u8> = (1..=12).chain([0x97, 0x22, 0x5A, 0x44]).collect();
+        let mut expected = vals.clone();
+        // NORMAL reads back from LATE/NORMAL
+        expected[0xE] = 0x57;
+        assert_eq!(params(&mut swim, &vals, 16), expected);
+    }
+
+    #[test]
+    fn swim2_params() {
+        let mut swim = Swim::new_swim2(&[DriveType::SuperDrive], 16_000_000);
+        let vals = [0x97, 0x22, 0x5A, 0x44];
+        assert_eq!(params(&mut swim, &vals, 4), [0x90, 0x22, 0x50, 0x44]);
+        // Wraps after four
+        assert_eq!(
+            params(&mut swim, &[1, 2, 3, 4, 0x65, 6], 6),
+            [0x00, 4, 0x60, 6, 0x00, 4]
+        );
+    }
+
+    #[test]
+    fn swim_to_iwm() {
+        let mut swim = swim(0x20);
+        swim.write(reg(REG_MODE_ZERO), 0xF8);
+        assert_eq!(swim.mode, SwimMode::Iwm);
+    }
+
+    #[test]
+    fn swim2_stays_ism() {
+        let mut swim = Swim::new_swim2(&[DriveType::SuperDrive], 16_000_000);
+        assert_eq!(swim.read(reg(REG_STATUS)), Some(0x40));
+        swim.write(reg(REG_MODE_ONE), 0x17);
+        assert_eq!(swim.read(reg(REG_STATUS)), Some(0x57));
+        swim.write(reg(REG_MODE_ZERO), 0xF8);
+        assert_eq!(swim.mode, SwimMode::Ism);
+        assert_eq!(swim.read(reg(REG_STATUS)), Some(0x47));
+
+        // The phase register still answers, which is how the ROM tells
+        // the SWIM2 from the SWIM
+        for val in [0xF5, 0xF6, 0xF7] {
+            swim.write(reg(REG_PHASES), val);
+            assert_eq!(swim.read(reg(REG_PHASES)), Some(val));
+        }
+    }
+
+    #[test]
+    fn write_no_disk() {
+        const BYTE_TICKS: Ticks = 16 * 16;
+
+        let mut swim = Swim::new_swim2(&[DriveType::SuperDrive], 16_000_000);
+        swim.write(reg(REG_SETUP), 0x20);
+        start(&mut swim, MODE_WRITE);
+        swim.write(reg(REG_DATA), 0);
+        swim.write(reg(REG_DATA), 0);
+        swim.write(reg(REG_MODE_ONE), MODE_ACTION);
+        assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0xC0, 0x00);
+
+        // Each byte makes room in the FIFO after its time
+        for _ in 0..20 {
+            swim.tick(BYTE_TICKS - 1, ()).unwrap();
+            assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0xC0, 0x00);
+            swim.tick(1, ()).unwrap();
+            assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0xC0, 0x80);
+            swim.write(reg(REG_DATA), 0);
+        }
+
+        // Then the FIFO runs empty, which ends the write
+        swim.tick(2 * BYTE_TICKS, ()).unwrap();
+        assert!(swim.ism_mode.action());
+        assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0xE0, 0xC0);
+        swim.tick(BYTE_TICKS, ()).unwrap();
+        assert!(!swim.ism_mode.action());
+        assert_eq!(swim.read(reg(REG_ERROR)), Some(0x01));
+    }
+
+    #[test]
+    fn strobe_no_drive_enabled() {
+        let mut swim = swim(0x20);
+        swim.write(reg(REG_MODE_ZERO), MODE_DRIVE1);
+
+        for phases in PHASES_EJECT {
+            swim.write(reg(REG_PHASES), phases);
+        }
+        swim.tick(1, ()).unwrap();
+        assert!(swim.drives[0].floppy_inserted);
+
+        swim.write(reg(REG_MODE_ONE), MODE_MOTOR | MODE_DRIVE1);
+        for phases in PHASES_EJECT {
+            swim.write(reg(REG_PHASES), phases);
+        }
+        swim.tick(1, ()).unwrap();
+        assert!(!swim.drives[0].floppy_inserted);
+    }
+
+    #[test]
+    fn sense_no_drive_enabled() {
+        let mut swim = swim(0x20);
+        swim.write(reg(REG_PHASES), PHASES_MOTOR_ON);
+        assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0x08, 0x00);
+
+        swim.write(reg(REG_MODE_ZERO), MODE_DRIVE1);
+        assert_eq!(swim.read(reg(REG_HANDSHAKE)).unwrap() & 0x08, 0x08);
     }
 }

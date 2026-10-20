@@ -1,9 +1,13 @@
+use std::ops::{Deref, DerefMut};
+
 use crate::bus::{Address, BusMember};
 use crate::debuggable::Debuggable;
+use crate::emulator::EmuContext;
 use crate::mac::pluskbd::PlusKeyboard;
 use crate::mac::rtc::Rtc;
-use crate::tickable::{Tickable, Ticks};
-use crate::types::{Byte, Field16};
+use crate::mac::via_common::{LineState, ViaCommon, ViaLine, ViaReg, ViaWiring};
+use crate::tickable::{TickConverter, Tickable, Ticks};
+use crate::types::Byte;
 
 use anyhow::Result;
 use proc_bitfield::bitfield;
@@ -16,6 +20,8 @@ use super::adb::AdbTransceiver;
 /// (counted on the E Clock)
 const ONESEC_TICKS: Ticks = 783360;
 
+/// Time it takes the keyboard or the ADB transceiver to clock a byte through
+/// the shift register. Ideally, these would time the transfer themselves.
 const SHIFT_DELAY: Ticks = ONESEC_TICKS * 3 / 1000;
 /// How long the M0110 holds an Inquiry ($10) with no key event before answering
 /// $7B (~250 ms).  Modelling this stops macmon re-polling every tick (60/s) and
@@ -41,9 +47,14 @@ const ACR_SHIFT_OUT: u8 = 0b111;
 const ACR_SHIFT_IN: u8 = 0b011;
 
 // SNOW_WATCH_IER T1 diagnostics
-static T1_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static T1CH_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static T1CL_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn watch_ier() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SNOW_WATCH_IER").is_ok())
+}
 
 bitfield! {
     /// VIA Register A (for classic models)
@@ -51,9 +62,6 @@ bitfield! {
     pub struct RegisterA(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
         /// Sound volume (non-ASC models)
         pub sound: u8 @ 0..=2,
-
-        /// Model sense (Mac II)
-        pub model: u8 @ 0..=2,
 
         /// Sound buffer
         /// (true = main, false = alternate)
@@ -135,48 +143,6 @@ bitfield! {
 }
 
 bitfield! {
-    /// VIA Auxiliary Control Register
-    #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct RegisterACR(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
-        /// Input latch register A
-        pub ralatch: bool @ 0,
-
-        /// Input latch register B
-        pub rblatch: bool @ 1,
-
-        /// Keyboard bit-shift operation
-        pub kbd: u8 @ 2..=4,
-
-        /// Timer T2 interrupts
-        pub t2: bool @ 5,
-
-        /// Timer T1 free-running mode
-        pub t1_freerun: bool @ 6,
-
-        /// Timer T1 output enable
-        pub t1_output_en: bool @ 7,
-    }
-}
-
-bitfield! {
-    /// VIA Peripheral Control Register
-    #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct RegisterPCR(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
-        /// VBlank
-        pub vblank: bool @ 0,
-
-        /// One second interrupt
-        pub onesec: u8 @ 1..=3,
-
-        /// Keyboard clock
-        pub kbdclk: bool @ 4,
-
-        /// Keyboard bit-shift operation
-        pub kbddata: u8 @ 5..=7,
-    }
-}
-
-bitfield! {
     /// VIA Interrupt flag/enable registers
     #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RegisterIRQ(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
@@ -210,116 +176,78 @@ bitfield! {
     }
 }
 
+pub struct Via1Wiring;
+
+impl ViaWiring for Via1Wiring {
+    type RegisterA = RegisterA;
+    type RegisterB = RegisterB;
+    type RegisterIRQ = RegisterIRQ;
+}
+
 /// Synertek SY6522 Versatile Interface Adapter
 #[derive(Serialize, Deserialize)]
 pub struct Via {
+    core: ViaCommon<Via1Wiring>,
+
     /// The currently emulated Macintosh model
     model: MacModel,
-
-    /// Register A, outputs
-    pub a_out: RegisterA,
-
-    /// Register A, inputs
-    pub a_in: RegisterA,
-
-    /// Data Direction Register A
-    pub ddra: RegisterA,
-
-    /// Register B, outputs
-    pub b_out: RegisterB,
-
-    /// Register B, inputs
-    pub b_in: RegisterB,
-
-    /// Data Direction Register B
-    pub ddrb: RegisterB,
-
-    /// Interrupt Enable Register
-    pub ier: RegisterIRQ,
-
-    /// Interrupt Flag Register
-    pub ifr: RegisterIRQ,
-
-    /// Peripheral Control Register
-    pub pcr: RegisterPCR,
-
-    /// Auxiliary Control Register
-    pub acr: RegisterACR,
-
-    /// Timer 2 Counter
-    pub t2cnt: Field16,
-
-    /// Timer 2 latch
-    pub t2latch: Field16,
 
     /// Counter for the one-second timer
     onesec: Ticks,
 
-    /// Shift register
-    sr: u8,
-
     kbdshift_in: u8,
     kbdshift_in_time: Ticks,
-    kbdshift_out: u8,
     kbdshift_out_time: Ticks,
     /// >0 while an Inquiry is being held (M0110 not yet answering); counts down
     /// to the ~250 ms timeout, or is cleared early when a key event arrives.
+    #[serde(default)]
     kbd_inquiry_hold: Ticks,
-
-    t1_enable: bool,
-
-    /// T1 output state is separate from the actual PB7 output
-    t1_output: bool,
-    t2_enable: bool,
-
-    /// Timer 1 Counter
-    pub t1cnt: Field16,
-
-    /// Timer 1 latch
-    pub t1latch: Field16,
 
     pub keyboard: PlusKeyboard,
     pub(crate) rtc: Rtc,
 
     pub(crate) adb: AdbTransceiver,
+
+    /// Runs the VIA at the speed of the bus of the real hardware, whatever
+    /// the bus frequency is: the VIA is used as a timer
+    bus_tick_converter: TickConverter,
 }
 
 impl Via {
-    pub fn new(model: MacModel) -> Self {
+    pub fn new(model: MacModel, bus_frequency: Ticks) -> Self {
+        let mut core = ViaCommon::new();
+        core.a_in = model.via1_a_in();
+
         Self {
+            core,
             model,
-            a_out: RegisterA(0xFF),
-            b_out: RegisterB(0xFF),
-            a_in: model.via1_a_in(),
-            b_in: RegisterB(0xFF),
-            ddra: RegisterA(0xFF),
-            ddrb: RegisterB(0xFF),
-            ier: RegisterIRQ(0),
-            ifr: RegisterIRQ(0),
-            acr: RegisterACR(0),
-            pcr: RegisterPCR(0),
-
-            t2cnt: Field16(0),
-            t2latch: Field16(0),
-            t2_enable: false,
-
-            t1cnt: Field16(0),
-            t1latch: Field16(0),
-            t1_enable: false,
-            t1_output: false,
 
             onesec: 0,
-            sr: 0,
             kbdshift_in: 0,
             kbdshift_in_time: 0,
-            kbdshift_out: 0,
             kbdshift_out_time: 0,
             kbd_inquiry_hold: 0,
 
             keyboard: PlusKeyboard::default(),
             rtc: Rtc::default(),
             adb: AdbTransceiver::default(),
+
+            bus_tick_converter: TickConverter::new(bus_frequency),
         }
+    }
+}
+
+impl Deref for Via {
+    type Target = ViaCommon<Via1Wiring>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for Via {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
     }
 }
 
@@ -328,274 +256,159 @@ impl BusMember<Address> for Via {
         if crate::perf::enabled() {
             crate::perf::via_read();
         }
-        match (addr >> 9) & 0xF {
-            // Timer 2 counter LSB
-            0x08 => {
-                self.ifr.set_t2(false);
-                Some(self.t2cnt.lsb())
-            }
-            // Timer 2 counter MSB
-            0x09 => Some(self.t2cnt.msb()),
+        let reg = ViaReg::from_addr(addr);
 
-            // Timer 1 counter LSB
-            0x04 => {
-                self.ifr.set_t1(false);
+        match reg {
+            ViaReg::T1CL => {
                 T1CL_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Some(self.t1cnt.lsb())
             }
-            // Timer 1 counter MSB
-            0x05 => Some(self.t1cnt.msb()),
-
-            // Timer 1 latch LSB
-            0x06 => Some(self.t1latch.lsb()),
-            // Timer 1 latch MSB
-            0x07 => Some(self.t1latch.msb()),
-
-            // Register B
-            0x00 => {
-                self.ifr.set_kbddata(false);
-                self.ifr.set_kbdclock(false);
-
+            ViaReg::SR => kbdtrace("SR-read  val/acrmode", self.core.sr, self.core.acr.sr_mode()),
+            ViaReg::B => {
                 // Lazy update ADB Int to current state
                 if self.model.has_adb() {
-                    self.b_in.set_adb_int(!self.adb.get_int());
+                    self.core.b_in.set_adb_int(!self.adb.get_int());
                 }
-
-                Some((self.b_in.0 & !self.ddrb.0) | (self.b_out.0 & self.ddrb.0))
             }
-
-            // Register B Data Direction
-            0x02 => Some(self.ddrb.0),
-
-            // Register A Data Direction
-            0x03 => Some(self.ddra.0),
-
-            // Shift register
-            0x0A => {
-                let sr = self.sr;
-                kbdtrace("SR-read  val/acrmode", sr, self.acr.kbd());
-                self.ifr.set_kbdready(false);
-
-                Some(sr)
-            }
-
-            // Auxiliary Control Register
-            0x0B => Some(self.acr.0),
-
-            // Peripheral Control Register
-            0x0C => Some(self.pcr.0),
-
-            // Interrupt Flag Register
-            0x0D => {
-                let mut val = self.ifr.0 & 0x7F;
-                if self.ifr.0 & self.ier.0 != 0 {
-                    val |= 0x80;
-                }
-                Some(val)
-            }
-
-            // Interrupt Enable Register
-            0x0E => Some(self.ier.0 | 0x80),
-
-            // Register A
-            0x01 | 0x0F => {
+            ViaReg::A | ViaReg::ANH => {
                 // The SCC write request bit is used for checking if there's data ready
                 // from the SCC in critical sections where SCC interrupts are disabled.
                 // Reporting 1 signals that there's no data ready.
-                self.a_in.set_sccwrreq(true);
-
-                self.ifr.set_vblank(false);
-                self.ifr.set_onesec(false);
-
-                Some((self.a_in.0 & !self.ddra.0) | (self.a_out.0 & self.ddra.0))
+                self.core.a_in.set_sccwrreq(true);
             }
-            _ => None,
+            _ => (),
         }
+
+        Some(self.core.read(reg))
     }
 
     fn write(&mut self, addr: Address, val: Byte) -> Option<()> {
         if crate::perf::enabled() {
             crate::perf::via_write();
         }
-        match (addr >> 9) & 0x0F {
-            // Timer 2 counter LSB
-            0x08 => Some(self.t2latch.set_lsb(val)),
+        let reg = ViaReg::from_addr(addr);
 
-            // Timer 2 counter MSB
-            0x09 => {
-                self.t2latch.set_msb(val);
-
-                // Clear interrupt flag
-                self.ifr.set_t2(false);
-
-                // Start timer
-                self.t2_enable = true;
-                self.t2cnt = self.t2latch;
-                Some(())
-            }
-
-            // Timer 1 counter LSB, Timer 1 latch LSB
-            0x04 | 0x06 => Some(self.t1latch.set_lsb(val)),
-
-            // Timer 1 latch MSB
-            0x07 => {
-                self.t1latch.set_msb(val);
-
-                // Clear interrupt flag
-                self.ifr.set_t1(false);
-
-                Some(())
-            }
-
-            // Timer 1 counter MSB
-            0x05 => {
-                self.t1latch.set_msb(val);
-                self.t1cnt.0 = self.t1latch.0;
+        match reg {
+            ViaReg::T1CH => {
                 T1CH_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                // Clear interrupt flag
-                self.ifr.set_t1(false);
-
-                // Start timer
-                self.t1_enable = true;
-                self.t1_output = false;
-                if self.acr.t1_output_en() {
-                    self.b_out.set_pb7(false);
-                }
-                Some(())
             }
+            ViaReg::SR => kbdtrace("SR-write val/acrmode", val, self.core.acr.sr_mode()),
+            ViaReg::IER if watch_ier() => {
+                // SNOW_WATCH_IER: log every IER write; flag when the T1 tick (0x40)
+                // or CA1 (0x02) enable transitions 1->0 (loses the clock tick).
+                let old = self.core.ier.0;
+                let new = if val & 0x80 != 0 {
+                    old | (val & 0x7F)
+                } else {
+                    old & !(val & 0x7F)
+                };
+                let lost_t1 = (old & 0x40) != 0 && (new & 0x40) == 0;
+                let lost_ca1 = (old & 0x02) != 0 && (new & 0x02) == 0;
+                eprintln!(
+                    "[IER] write val={:#04x} ({}) IER {:#04x}->{:#04x}{}{}",
+                    val,
+                    if val & 0x80 != 0 { "SET" } else { "CLR" },
+                    old,
+                    new,
+                    if lost_t1 { "  *** LOST T1 TICK ***" } else { "" },
+                    if lost_ca1 { "  *** LOST CA1 ***" } else { "" },
+                );
+            }
+            _ => (),
+        }
 
+        if reg == ViaReg::ACR {
+            // SNOW_WATCH_IER: flag when ACR bit 6 (T1 free-run reload) is
+            // cleared -- that switches T1 to one-shot, so the tick stops
+            // after its next fire.
+            if watch_ier() && (self.core.acr.0 & 0x40) != 0 && (val & 0x40) == 0 {
+                eprintln!(
+                    "[ACR] val={:#04x} {:#04x}->{:#04x}  *** LOST T1 FREE-RUN (bit6) ***",
+                    val, self.core.acr.0, val
+                );
+            }
+            let oldmode = self.core.acr.sr_mode();
+            self.core.write(reg, val);
+            let newmode = self.core.acr.sr_mode();
+
+            if newmode != oldmode {
+                kbdtrace("ACR-mode old/new", oldmode, newmode);
+                // Reset shifter operation
+                self.kbdshift_in_time = 0;
+                self.kbdshift_out_time = 0;
+            }
+            if newmode == ACR_SHIFT_IN {
+                self.kbdshift_in_time = SHIFT_DELAY;
+            } else if newmode == ACR_SHIFT_OUT {
+                self.kbdshift_out_time = SHIFT_DELAY;
+            }
+            return Some(());
+        }
+
+        self.core.write(reg, val);
+
+        match reg {
             // Keyboard shift register
-            0x0A => {
-                self.ifr.set_kbdready(false);
-
-                kbdtrace("SR-write val/acrmode", val, self.acr.kbd());
-                self.sr = val;
-                if self.acr.kbd() == ACR_SHIFT_OUT {
+            ViaReg::SR => {
+                if self.core.acr.sr_mode() == ACR_SHIFT_OUT {
                     // Start shift-out
-                    self.kbdshift_out = val;
                     self.kbdshift_out_time = SHIFT_DELAY;
                 }
-                Some(())
             }
-
-            // Register B
-            0x00 => {
-                self.ifr.set_kbddata(false);
-                self.ifr.set_kbdclock(false);
-
-                self.b_out.0 = val;
+            ViaReg::B => {
                 let rtcin = self.rtc.io(
-                    self.b_out.rtcenb(),
-                    self.b_out.rtcclk(),
-                    self.b_out.rtcdata(),
+                    self.core.pb().rtcenb(),
+                    self.core.pb().rtcclk(),
+                    self.core.pb().rtcdata(),
                 );
-                self.b_in.set_rtcdata(rtcin);
+                self.core.b_in.set_rtcdata(rtcin);
 
                 if self.model.has_adb()
-                    && let Some(b) = self.adb.io(self.b_out.adb_st0(), self.b_out.adb_st1())
+                    && let Some(b) = self
+                        .adb
+                        .io(self.core.pb().adb_st0(), self.core.pb().adb_st1())
                 {
                     self.kbdshift_in = b;
                 }
-
-                Some(())
             }
-
-            // Register B Data Direction
-            0x02 => Some(self.ddrb.0 = val),
-
-            // Register A Data Direction
-            0x03 => Some(self.ddra.0 = val),
-
-            // Auxiliary Control Register
-            0x0B => {
-                let newacr = RegisterACR(val);
-                if newacr.kbd() != self.acr.kbd() {
-                    kbdtrace("ACR-mode old/new", self.acr.kbd(), newacr.kbd());
-                    // Reset shifter operation
-                    self.kbdshift_in_time = 0;
-                    self.kbdshift_out_time = 0;
-                }
-                if newacr.kbd() == ACR_SHIFT_IN {
-                    self.kbdshift_in_time = SHIFT_DELAY;
-                } else if newacr.kbd() == ACR_SHIFT_OUT {
-                    self.kbdshift_out = self.sr;
-                    self.kbdshift_out_time = SHIFT_DELAY;
-                }
-                // SNOW_WATCH_IER: flag when ACR bit 6 (T1 free-run reload) is
-                // cleared -- that switches T1 to one-shot, so the tick stops
-                // after its next fire.
-                if std::env::var("SNOW_WATCH_IER").is_ok() && (self.acr.0 & 0x40) != 0 && (val & 0x40) == 0 {
-                    eprintln!("[ACR] val={:#04x} {:#04x}->{:#04x}  *** LOST T1 FREE-RUN (bit6) ***", val, self.acr.0, val);
-                }
-                Some(self.acr.0 = val)
-            }
-
-            // Peripheral Control Register
-            0x0C => Some(self.pcr.0 = val),
-
-            // Interrupt Flag register
-            0x0D => {
-                self.ifr.0 &= !(val & 0x7F);
-                Some(())
-            }
-
-            // Interrupt Enable register
-            0x0E => {
-                let old = self.ier.0;
-                let newflags = if val & 0x80 != 0 {
-                    // Enable
-                    RegisterIRQ(self.ier.0 | (val & 0x7F))
-                } else {
-                    // Disable
-                    RegisterIRQ(self.ier.0 & !(val & 0x7F))
-                };
-                self.ier = newflags;
-                // SNOW_WATCH_IER: log every IER write; flag when the T1 tick (0x40)
-                // or CA1 (0x02) enable transitions 1->0 (loses the clock tick).
-                if std::env::var("SNOW_WATCH_IER").is_ok() {
-                    let lost_t1 = (old & 0x40) != 0 && (newflags.0 & 0x40) == 0;
-                    let lost_ca1 = (old & 0x02) != 0 && (newflags.0 & 0x02) == 0;
-                    eprintln!(
-                        "[IER] write val={:#04x} ({}) IER {:#04x}->{:#04x}{}{}",
-                        val,
-                        if val & 0x80 != 0 { "SET" } else { "CLR" },
-                        old, newflags.0,
-                        if lost_t1 { "  *** LOST T1 TICK ***" } else { "" },
-                        if lost_ca1 { "  *** LOST CA1 ***" } else { "" },
-                    );
-                }
-                Some(())
-            }
-
-            // Register A
-            0x01 | 0x0F => {
-                self.ifr.set_vblank(false);
-                self.ifr.set_onesec(false);
-
-                self.a_out.0 = val;
-                Some(())
-            }
-
-            _ => None,
+            _ => (),
         }
+
+        Some(())
     }
 }
 
-impl Tickable for Via {
-    fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
+impl Tickable<&dyn EmuContext> for Via {
+    fn tick(&mut self, ticks: Ticks, ctx: &dyn EmuContext) -> Result<Ticks> {
+        self.bus_tick_converter.add_a_ticks(ticks);
+        let via_ticks = self.bus_tick_converter.get_b_ticks(ctx.bus_frequency());
+        if via_ticks > 0 {
+            self.tick_16mhz(via_ticks)?;
+            self.bus_tick_converter
+                .subtract_b_ticks(via_ticks, ctx.bus_frequency());
+        }
+        Ok(ticks)
+    }
+}
+
+impl Via {
+    fn tick_16mhz(&mut self, ticks: Ticks) -> Result<Ticks> {
         // SNOW_WATCH_IER: periodic dump of T1 health -- fires, T1CH-resets,
         // enable/free-run/IER state -- to see whether the tick T1 stops
         // overflowing under load and why.
-        if std::env::var("SNOW_WATCH_IER").is_ok() {
+        if watch_ier() {
             use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Relaxed) % 3_000_000 == 2_999_999 {
                 eprintln!(
                     "[T1] fires={} t1ch_resets={} t1cl_reads={} | t1_enable={} freerun={} ier_t1={} t1cnt={:#06x} latch={:#06x}",
-                    T1_FIRES.load(Relaxed), T1CH_RESETS.load(Relaxed), T1CL_READS.load(Relaxed),
-                    self.t1_enable, self.acr.t1_freerun(), (self.ier.0 & 0x40) != 0,
-                    self.t1cnt.0, self.t1latch.0,
+                    self.core.t1_fires,
+                    T1CH_RESETS.load(Relaxed),
+                    T1CL_READS.load(Relaxed),
+                    self.core.t1_enabled(),
+                    self.core.acr.t1_freerun(),
+                    (self.core.ier.0 & 0x40) != 0,
+                    self.core.t1cnt.0,
+                    self.core.t1latch.0,
                 );
             }
         }
@@ -605,46 +418,19 @@ impl Tickable for Via {
         // One second interrupt
         if self.onesec >= ONESEC_TICKS {
             self.onesec -= ONESEC_TICKS;
-            self.ifr.set_onesec(true);
+            self.core.set_line(ViaLine::CA2, LineState::Pulse);
             self.rtc.second();
         }
 
-        // Timer 1
-        let t1ovf;
-        (self.t1cnt.0, t1ovf) = self.t1cnt.0.overflowing_sub(ticks.try_into()?);
-
-        if t1ovf && self.t1_enable {
-            T1_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.ifr.set_t1(true);
-            if !self.acr.t1_freerun() {
-                // Single shot mode
-                self.t1_enable = false;
-                self.t1_output = true;
-            } else {
-                // Free running mode
-                self.t1cnt.0 = self.t1latch.0;
-                self.t1_output = !self.t1_output;
-            }
-            if self.acr.t1_output_en() {
-                self.b_out.set_pb7(self.t1_output);
-            }
-        }
-
-        // Timer 2
-        let t2ovf;
-        (self.t2cnt.0, t2ovf) = self.t2cnt.0.overflowing_sub(ticks.try_into()?);
-
-        if t2ovf && self.t2_enable {
-            self.t2_enable = false;
-            self.ifr.set_t2(true);
-        }
+        self.core.tick_timers(ticks)?;
 
         // ADB/Keyboard response
         if self.kbdshift_out_time > 0 {
             self.kbdshift_out_time = self.kbdshift_out_time.saturating_sub(ticks);
             if self.kbdshift_out_time == 0 {
+                let data = self.core.shift_sr(0);
                 if !self.model.has_adb() {
-                    match self.keyboard.cmd(self.kbdshift_out)? {
+                    match self.keyboard.cmd(data)? {
                         Some(b) => {
                             self.kbdshift_in = b;
                             self.kbd_inquiry_hold = 0;
@@ -654,10 +440,9 @@ impl Tickable for Via {
                         None => self.kbd_inquiry_hold = INQUIRY_HOLD,
                     }
                 } else {
-                    self.adb.data_in(self.kbdshift_out);
+                    self.adb.data_in(data);
                 }
-                kbdtrace("OUT-done  cmd/sr", self.kbdshift_out, self.sr);
-                self.ifr.set_kbdready(true);
+                kbdtrace("OUT-done  cmd/sr", data, self.core.sr);
             }
         }
         if self.kbdshift_in_time > 0 {
@@ -673,8 +458,7 @@ impl Tickable for Via {
                         }
                         self.kbd_inquiry_hold = 0;
                     } else {
-                        self.kbd_inquiry_hold =
-                            self.kbd_inquiry_hold.saturating_sub(SHIFT_DELAY);
+                        self.kbd_inquiry_hold = self.kbd_inquiry_hold.saturating_sub(SHIFT_DELAY);
                         if self.kbd_inquiry_hold == 0 {
                             self.kbdshift_in = 0x7B; // hold expired -> null
                         } else {
@@ -683,10 +467,8 @@ impl Tickable for Via {
                         }
                     }
                 }
-                kbdtrace("IN-done   byte/acrmode", self.kbdshift_in, self.acr.kbd());
-                self.sr = self.kbdshift_in;
-                self.ifr.set_kbdready(true);
-                self.kbdshift_in = self.sr;
+                kbdtrace("IN-done   byte/acrmode", self.kbdshift_in, self.core.acr.sr_mode());
+                self.core.shift_sr(self.kbdshift_in);
                 self.kbdshift_in_time = SHIFT_DELAY;
             }
         }
@@ -698,56 +480,109 @@ impl Tickable for Via {
 impl Debuggable for Via {
     fn get_debug_properties(&self) -> crate::debuggable::DebuggableProperties {
         use crate::debuggable::*;
-        use crate::{dbgprop_bool, dbgprop_byte_bin, dbgprop_group, dbgprop_udec, dbgprop_word};
+        use crate::{dbgprop_byte_bin, dbgprop_group, dbgprop_udec};
 
-        vec![
-            dbgprop_group!(
-                "Register A",
-                vec![
-                    dbgprop_byte_bin!("DDRA", self.ddra.0),
-                    dbgprop_byte_bin!("Inputs", self.a_in.0),
-                    dbgprop_byte_bin!("Outputs", self.a_out.0),
-                ]
-            ),
-            dbgprop_group!(
-                "Register B",
-                vec![
-                    dbgprop_byte_bin!("DDRB", self.ddrb.0),
-                    dbgprop_byte_bin!("Inputs", self.b_in.0),
-                    dbgprop_byte_bin!("Outputs", self.b_out.0),
-                ]
-            ),
-            dbgprop_group!(
-                "Timer 1",
-                vec![
-                    dbgprop_word!("Counter", self.t1cnt.0),
-                    dbgprop_word!("Latch", self.t1latch.0),
-                    dbgprop_bool!("Armed", self.t1_enable)
-                ]
-            ),
-            dbgprop_group!(
-                "Timer 2",
-                vec![
-                    dbgprop_word!("Counter", self.t2cnt.0),
-                    dbgprop_word!("Latch", self.t2latch.0),
-                    dbgprop_bool!("Armed", self.t2_enable)
-                ]
-            ),
-            dbgprop_group!(
-                "Keyboard shifter",
-                vec![
-                    dbgprop_byte_bin!("Shift register", self.sr),
-                    dbgprop_byte_bin!("Input", self.kbdshift_in),
-                    dbgprop_udec!("Input timer", self.kbdshift_in_time),
-                    dbgprop_byte_bin!("Output", self.kbdshift_out),
-                    dbgprop_udec!("Output timer", self.kbdshift_out_time),
-                ]
-            ),
-            dbgprop_udec!("One second timer", self.onesec),
-            dbgprop_byte_bin!("Interrupt Enable (IER)", self.ier.0),
-            dbgprop_byte_bin!("Interrupt Flags (IFR)", self.ifr.0),
-            dbgprop_byte_bin!("Peripheral Control (PCR)", self.pcr.0),
-            dbgprop_byte_bin!("Auxiliary Control (ACR)", self.acr.0),
-        ]
+        let mut props = self.core.debug_properties_ports();
+        props.push(dbgprop_group!(
+            "Keyboard shifter",
+            vec![
+                dbgprop_byte_bin!("Shift register", self.core.sr),
+                dbgprop_byte_bin!("Input", self.kbdshift_in),
+                dbgprop_udec!("Input timer", self.kbdshift_in_time),
+                dbgprop_udec!("Output timer", self.kbdshift_out_time),
+            ]
+        ));
+        props.push(dbgprop_udec!("One second timer", self.onesec));
+        props.extend(self.core.debug_properties_control());
+        props
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mac::via_common::{IRQ_CA1, IRQ_CA2, IRQ_CB1, IRQ_CB2};
+
+    /// Register A with handshake
+    const ADDR_A_HS: Address = 0x01 << 9;
+    /// Register A without handshake (vBufA)
+    const ADDR_A: Address = 0x0F << 9;
+    const ADDR_PCR: Address = 0x0C << 9;
+    const ADDR_B: Address = 0x00 << 9;
+
+    #[test]
+    fn reg_a_no_handshake_keeps_irq_flags() {
+        let mut via = Via::new(MacModel::Plus, 16_000_000);
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A);
+        assert!(via.ifr().vblank() && via.ifr().onesec());
+        via.write(ADDR_A, 0);
+        assert!(via.ifr().vblank() && via.ifr().onesec());
+    }
+
+    #[test]
+    fn reg_a_handshake_clears_irq_flags() {
+        let mut via = Via::new(MacModel::Plus, 16_000_000);
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().vblank() && !via.ifr().onesec());
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.write(ADDR_A_HS, 0);
+        assert!(!via.ifr().vblank() && !via.ifr().onesec());
+    }
+
+    #[test]
+    fn independent_ca2_keeps_irq_flag() {
+        let mut via = Via::new(MacModel::Plus, 16_000_000);
+
+        // CA2 independent interrupt input, negative edge
+        via.write(ADDR_PCR, 0x02);
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().vblank() && via.ifr().onesec());
+
+        // Positive edge
+        via.write(ADDR_PCR, 0x06);
+        via.write(ADDR_A_HS, 0);
+        assert!(via.ifr().onesec());
+
+        // Handshake output is not independent
+        via.write(ADDR_PCR, 0x0A);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().onesec());
+    }
+
+    #[test]
+    fn independent_cb2_keeps_irq_flag() {
+        let mut via = Via::new(MacModel::Plus, 16_000_000);
+
+        via.set_irq(IRQ_CB2);
+        via.set_irq(IRQ_CB1);
+        via.read(ADDR_B);
+        assert!(!via.ifr().kbddata() && !via.ifr().kbdclock());
+
+        // CB2 independent interrupt input, negative edge
+        via.write(ADDR_PCR, 0x20);
+        via.set_irq(IRQ_CB2);
+        via.set_irq(IRQ_CB1);
+        via.read(ADDR_B);
+        assert!(via.ifr().kbddata() && !via.ifr().kbdclock());
+
+        // Positive edge
+        via.write(ADDR_PCR, 0x60);
+        via.write(ADDR_B, 0);
+        assert!(via.ifr().kbddata());
+
+        // Handshake output is not independent
+        via.write(ADDR_PCR, 0xA0);
+        via.read(ADDR_B);
+        assert!(!via.ifr().kbddata());
     }
 }

@@ -2,7 +2,7 @@ use crate::dialogs::about::AboutDialog;
 use crate::dialogs::confirm::ConfirmDialog;
 use crate::dialogs::diskimage::{DiskImageDialog, DiskImageDialogResult};
 use crate::dialogs::filedialog::SnowFileDialog;
-use crate::dialogs::modelselect::{ModelSelectionDialog, ModelSelectionResult};
+use crate::dialogs::modelselect::{ModelSelectionDialog, ModelSelectionResult, video_rom_card};
 use crate::emulator::EmulatorState;
 use crate::emulator::{EmulatorInitArgs, ScsiTarget, ScsiTargets};
 use crate::keymap::{char_to_keystroke, map_winit_keycode};
@@ -177,6 +177,12 @@ pub struct SnowGui {
     occluded: bool,
     in_zen_mode: bool,
     pre_fullscreen_mouse_mode: Option<MouseMode>,
+    /// Sub-pixel remainder of scaled relative mouse motion, carried to the next event
+    mouse_rel_remainder: egui::Vec2,
+    mouse_grabbed: bool,
+    mouse_grab_applied: bool,
+    mouse_grab_hint_shown: bool,
+    mouse_button_down: bool,
 
     wev_recv: crossbeam_channel::Receiver<egui_winit::winit::event::WindowEvent>,
 
@@ -197,6 +203,7 @@ pub struct SnowGui {
     cdrom_dialog: SnowFileDialog,
     cdrom_dialog_idx: usize,
     cdrom_files_dialog: SnowFileDialog,
+    cdrom_folder_dialog: SnowFileDialog,
     floppy_dialog: SnowFileDialog,
     floppy_dialog_last: Option<DirectoryEntry>,
     floppy_dialog_last_image: Option<FloppyImage>,
@@ -313,9 +320,11 @@ impl SnowGui {
             Some(SerialBridgeConfig::Pty)
         } else if let Some(port_str) = mode.strip_prefix("tcp:") {
             port_str.parse::<u16>().ok().map(SerialBridgeConfig::Tcp)
+        } else if mode == "localtalk" {
+            Some(SerialBridgeConfig::LocalTalk)
         } else {
             log::warn!(
-                "Invalid serial bridge mode: '{}'. Use 'pty' or 'tcp:PORT'",
+                "Invalid serial bridge mode: '{}'. Use 'pty', 'tcp:PORT' or 'localtalk'",
                 mode
             );
             None
@@ -352,6 +361,11 @@ impl SnowGui {
             occluded: false,
             in_zen_mode: false,
             pre_fullscreen_mouse_mode: None,
+            mouse_rel_remainder: egui::Vec2::ZERO,
+            mouse_grabbed: false,
+            mouse_grab_applied: false,
+            mouse_grab_hint_shown: false,
+            mouse_button_down: false,
 
             wev_recv,
             mode_toast_hide_requested: mode_toast_hide_requested.clone(),
@@ -407,6 +421,10 @@ impl SnowGui {
                 .opening_mode(egui_file_dialog::OpeningMode::LastVisitedDir)
                 .initial_directory(Self::default_dir())
                 .storage(settings.fd_cdrom_files),
+            cdrom_folder_dialog: SnowFileDialog::new()
+                .opening_mode(egui_file_dialog::OpeningMode::LastVisitedDir)
+                .initial_directory(Self::default_dir())
+                .storage(settings.fd_cdrom_folder),
             floppy_dialog: SnowFileDialog::new()
                 .add_filter(
                     "Floppy images",
@@ -516,11 +534,13 @@ impl SnowGui {
             let mut targets: ScsiTargets = std::array::from_fn(|_| ScsiTarget {
                 target_type: None,
                 image_path: None,
+                cdrom_folder: None,
             });
             for (id, disk_path) in hdds {
                 targets[*id] = ScsiTarget {
                     target_type: Some(snow_core::mac::scsi::target::ScsiTargetType::Disk),
                     image_path: Some(PathBuf::from(disk_path)),
+                    cdrom_folder: None,
                 };
             }
             Some(targets)
@@ -586,6 +606,7 @@ impl SnowGui {
             if current != MouseMode::Disabled {
                 self.pre_fullscreen_mouse_mode = Some(current);
                 self.emu.set_mouse_mode(MouseMode::RelativeHw);
+                self.grab_mouse(ctx);
             }
         }
         if !self.settings.hide_mode_toasts {
@@ -605,6 +626,7 @@ impl SnowGui {
     fn exit_fullscreen(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         self.in_fullscreen = false;
+        self.release_mouse_grab();
         if let Some(mode) = self.pre_fullscreen_mouse_mode.take() {
             self.emu.set_mouse_mode(mode);
         }
@@ -632,6 +654,91 @@ impl SnowGui {
 
     fn is_ui_hidden(&self) -> bool {
         self.in_fullscreen || self.in_zen_mode
+    }
+
+    /// Whether the mouse can be grabbed right now.
+    ///
+    /// Grabbing only makes sense in relative mouse mode.
+    fn can_grab_mouse(&self) -> bool {
+        self.settings.mouse_capture && self.emu.is_running() && self.emu.is_mouse_relative()
+    }
+
+    /// Whether mouse input currently reaches the machine.
+    fn mouse_input_active(&self, ctx: &egui::Context) -> bool {
+        if self.can_grab_mouse() {
+            return self.mouse_grabbed;
+        }
+
+        self.get_machine_mouse_pos(ctx).is_some()
+            || (self.in_fullscreen && self.emu.is_mouse_relative())
+    }
+
+    /// Grabs the mouse, confining the host cursor to the window.
+    fn grab_mouse(&mut self, ctx: &egui::Context) {
+        if self.mouse_grabbed || !self.can_grab_mouse() {
+            return;
+        }
+        self.mouse_grabbed = true;
+
+        // Close menus
+        egui::Popup::close_all(ctx);
+
+        // In fullscreen the mode toast already tells the user about right-clicking
+        if !self.mouse_grab_hint_shown && !self.settings.hide_mode_toasts && !self.in_fullscreen {
+            // Show once per session
+            self.mouse_grab_hint_shown = true;
+            self.toasts.add(
+                egui_toast::Toast::default()
+                    // Don't show the 'dont show again' button because the user can't click it anyway.
+                    .kind(ToastKind::Info)
+                    .text("RIGHT-CLICK to release the mouse")
+                    .options(
+                        egui_toast::ToastOptions::default()
+                            .duration(Self::TOAST_DURATION)
+                            .show_progress(true),
+                    ),
+            );
+        }
+    }
+
+    /// Releases the mouse grab, if any.
+    fn release_mouse_grab(&mut self) {
+        self.mouse_grabbed = false;
+    }
+
+    /// Syncs the requested grab state to the windowing system.
+    fn update_mouse_grab(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        const GRAB_MODE: egui::CursorGrab = egui::CursorGrab::Locked;
+        #[cfg(not(target_os = "macos"))]
+        const GRAB_MODE: egui::CursorGrab = egui::CursorGrab::Confined;
+
+        self.mouse_grabbed &= self.can_grab_mouse();
+
+        let grab = self.mouse_grabbed && self.ui_active;
+        if grab != self.mouse_grab_applied {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(if grab {
+                GRAB_MODE
+            } else {
+                egui::CursorGrab::None
+            }));
+            self.mouse_grab_applied = grab;
+        }
+    }
+
+    /// Scales relative mouse motion by the configured mouse speed
+    fn apply_mouse_speed(&mut self, relpos: egui::Pos2) -> egui::Pos2 {
+        if !self.emu.is_mouse_relative() {
+            return relpos;
+        }
+
+        let scaled = egui::Vec2::new(
+            relpos.x * self.settings.relative_mouse_speed,
+            relpos.y * self.settings.relative_mouse_speed,
+        ) + self.mouse_rel_remainder;
+        let whole = egui::Vec2::new(scaled.x.trunc(), scaled.y.trunc());
+        self.mouse_rel_remainder = scaled - whole;
+        whole.to_pos2()
     }
 
     fn try_create_image(&self, result: &DiskImageDialogResult) -> Result<()> {
@@ -704,6 +811,9 @@ impl SnowGui {
                 if self.emu.is_initialized() {
                     if ui.button("Reset").clicked() {
                         self.emu.reset();
+                        if self.settings.run_on_reset {
+                            self.emu.run();
+                        }
                     }
 
                     if self.emu.is_running() && ui.button("Stop").clicked() {
@@ -812,6 +922,12 @@ impl SnowGui {
                         ui.separator();
                         for (i, target) in targets.iter().enumerate() {
                             self.draw_scsi_target_menu(ui, i, target.as_ref(), true);
+                        }
+                        ui.separator();
+                        if ui.button("Detach all SCSI targets").clicked() {
+                            for (id, _) in targets.iter().enumerate().filter(|(_, t)| t.is_some()) {
+                                self.emu.scsi_detach_target(id);
+                            }
                         }
                     }
                 });
@@ -975,6 +1091,34 @@ impl SnowGui {
                     {
                         self.settings.save();
                     }
+                    if ui
+                        .checkbox(
+                            &mut self.settings.mouse_capture,
+                            "Capture mouse (relative mode)",
+                        )
+                        .on_hover_text(
+                            "In relative mouse mode, confine the mouse cursor to the window. \
+                            Click the screen to capture the mouse, right-click to release it.",
+                        )
+                        .clicked()
+                    {
+                        self.settings.save();
+                    }
+                    ui.label("Relative mouse speed");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.settings.relative_mouse_speed,
+                                0.25_f32..=4.0_f32,
+                            )
+                            .step_by(0.05)
+                            .suffix("x"),
+                        )
+                        .on_hover_text("Multiplier applied to mouse motion in relative mouse mode")
+                        .changed()
+                    {
+                        self.settings.save();
+                    }
                     ui.menu_button("Map alternate Cmd key", |ui| {
                         let prev = self.settings.cmd_key_mapping;
                         ui.radio_value(
@@ -1105,6 +1249,21 @@ impl SnowGui {
                         .on_hover_text(
                             "Before writeback is enabled for a floppy image, copy it to a \
                              timestamped sibling file in the same directory.",
+                        )
+                        .clicked()
+                    {
+                        self.settings.save();
+                    }
+                });
+                ui.menu_button("Debugger", |ui| {
+                    ui.set_min_width(Self::SUBMENU_WIDTH);
+                    if ui
+                        .checkbox(
+                            &mut self.settings.run_on_reset,
+                            "Always run emulator on reset",
+                        )
+                        .on_hover_text(
+                            "Always automatically run the emulator when reset is used in the debugger UI",
                         )
                         .clicked()
                     {
@@ -1427,6 +1586,14 @@ impl SnowGui {
                             ),
                             |ui| {
                                 ui.set_min_width(Self::SUBMENU_WIDTH);
+                                if let Some(folder) = target.cdrom_folder.as_ref() {
+                                    ui.weak(format!(
+                                        "Toolbox managed folder:\n{}",
+                                        folder.display()
+                                    ));
+                                    ui.weak("Guest swaps discs via the BlueSCSI Toolbox");
+                                    ui.separator();
+                                }
                                 if show_detach {
                                     if ui.button("Detach CD-ROM drive").clicked() {
                                         self.emu.scsi_detach_target(id);
@@ -1446,6 +1613,13 @@ impl SnowGui {
                             ),
                             |ui| {
                                 ui.set_min_width(Self::SUBMENU_WIDTH);
+                                if let Some(folder) = target.cdrom_folder.as_ref() {
+                                    ui.weak(format!(
+                                        "Toolbox managed folder:\n{}",
+                                        folder.display()
+                                    ));
+                                    ui.separator();
+                                }
                                 if ui.button("Load image...").clicked() {
                                     self.cdrom_dialog_idx = id;
                                     self.cdrom_dialog
@@ -1470,6 +1644,18 @@ impl SnowGui {
                                     self.cdrom_dialog_idx = id;
                                     self.cdrom_files_dialog
                                         .pick_multiple(self.settings.native_file_dialogs);
+                                }
+                                if ui
+                                    .button("Attach Toolbox managed folder...")
+                                    .on_hover_text(
+                                        "Replace this drive with a folder of CD images the \
+                                         guest can swap between using the BlueSCSI Toolbox",
+                                    )
+                                    .clicked()
+                                {
+                                    self.cdrom_dialog_idx = id;
+                                    self.cdrom_folder_dialog
+                                        .pick_directory(self.settings.native_file_dialogs);
                                 }
                                 if let Some(physical_drives) = snow_core::mac::scsi::cdrom::backends::query_physical_cdrom_drives() {
                                     ui.menu_button("Mount physical CD-ROM drive", |ui| {
@@ -1657,6 +1843,18 @@ impl SnowGui {
                     if ui.button("Attach CD-ROM drive (empty)").clicked() {
                         self.emu.scsi_attach_cdrom(id);
                     }
+                    if ui
+                        .button("Attach CD-ROM drive (Toolbox managed Folder)...")
+                        .on_hover_text(
+                            "Attach a folder of CD images the guest can swap between \
+                             using the BlueSCSI Toolbox",
+                        )
+                        .clicked()
+                    {
+                        self.cdrom_dialog_idx = id;
+                        self.cdrom_folder_dialog
+                            .pick_directory(self.settings.native_file_dialogs);
+                    }
                     #[cfg(feature = "ethernet")]
                     {
                         ui.separator();
@@ -1703,7 +1901,7 @@ impl SnowGui {
         }
     }
 
-    fn draw_serial_bridge_menu(&self, ui: &mut egui::Ui, ch: SccCh) {
+    fn draw_serial_bridge_menu(&mut self, ui: &mut egui::Ui, ch: SccCh) {
         let is_enabled = self.emu.is_serial_bridge_enabled(ch);
         let emu_ready = self.emu.is_initialized();
 
@@ -1717,6 +1915,7 @@ impl SnowGui {
                 .clicked()
             {
                 let _ = self.emu.disable_serial_bridge(ch);
+                self.workspace.serial_bridges[ch as usize] = None;
             }
         } else {
             // Bridge is inactive - show enable options
@@ -1728,6 +1927,7 @@ impl SnowGui {
                 .clicked()
             {
                 let _ = self.emu.enable_serial_bridge(ch, SerialBridgeConfig::Pty);
+                self.workspace.serial_bridges[ch as usize] = Some(SerialBridgeConfig::Pty);
             }
 
             let port = match ch {
@@ -1744,6 +1944,7 @@ impl SnowGui {
                 let _ = self
                     .emu
                     .enable_serial_bridge(ch, SerialBridgeConfig::Tcp(port));
+                self.workspace.serial_bridges[ch as usize] = Some(SerialBridgeConfig::Tcp(port));
             }
 
             if ui
@@ -1753,6 +1954,7 @@ impl SnowGui {
                 let _ = self
                     .emu
                     .enable_serial_bridge(ch, SerialBridgeConfig::LocalTalk);
+                self.workspace.serial_bridges[ch as usize] = Some(SerialBridgeConfig::LocalTalk);
             }
         }
     }
@@ -1948,6 +2150,9 @@ impl SnowGui {
                     .clicked()
                 {
                     self.emu.reset();
+                    if self.settings.run_on_reset {
+                        self.emu.run();
+                    }
                 }
 
                 if self.emu.is_running() {
@@ -2531,7 +2736,8 @@ impl SnowGui {
         if let Some(model) = model {
             self.settings.set_last_rom(model, path);
             if let Some(dr_path) = display_rom_path {
-                self.settings.set_last_card_rom(args.video_card, dr_path);
+                self.settings
+                    .set_last_card_rom(video_rom_card(model, args.video_card), dr_path);
             }
         }
 
@@ -2552,7 +2758,7 @@ impl SnowGui {
                     self.settings.add_recent_workspace(path);
                     self.model_dialog_prefill_pending = true;
                 }
-                Err(e) => self.show_error(&format!("Failed to load workspace: {}", e)),
+                Err(e) => self.show_error(&format!("Failed to load workspace\n\n{:?}", e)),
             }
         } else {
             // Clean workspace
@@ -2604,6 +2810,15 @@ impl SnowGui {
             {
                 self.emu
                     .set_eth_link(id, self.workspace.get_ethernet_link_type());
+            }
+
+            // Bridges given on the command line take precedence over the workspace
+            for (idx, ch) in [SccCh::A, SccCh::B].into_iter().enumerate() {
+                if self.pending_serial_bridges[idx].is_none()
+                    && let Some(config) = self.workspace.serial_bridges[idx].clone()
+                {
+                    let _ = self.emu.enable_serial_bridge(ch, config);
+                }
             }
         } else {
             self.emu.deinit();
@@ -3509,6 +3724,17 @@ impl eframe::App for SnowGui {
         }
         self.ui_active &= *self.cdrom_files_dialog.state() != egui_file_dialog::DialogState::Open;
 
+        // CD-ROM "Toolbox managed" folder picker dialog
+        self.cdrom_folder_dialog.update(ctx, frame);
+        if let Some(path) = self.cdrom_folder_dialog.take_picked() {
+            self.emu
+                .scsi_attach_cdrom_folder(self.cdrom_dialog_idx, path);
+
+            self.settings.fd_cdrom_folder = self.cdrom_folder_dialog.storage_mut().clone();
+            self.settings.save();
+        }
+        self.ui_active &= *self.cdrom_folder_dialog.state() != egui_file_dialog::DialogState::Open;
+
         // Shared directory picker dialog
         self.shared_dir_dialog.update(ctx, frame);
         if let Some(path) = self.shared_dir_dialog.take_picked() {
@@ -3771,6 +3997,9 @@ impl eframe::App for SnowGui {
                         }
                         if ui.button("Reset machine").clicked() {
                             self.emu.reset();
+                            if self.settings.run_on_reset {
+                                self.emu.run();
+                            }
                         }
                     });
                 }
@@ -3917,14 +4146,15 @@ impl eframe::App for SnowGui {
             }
         });
 
+        // Confine the host cursor to the window while the mouse is grabbed
+        self.update_mouse_grab(ctx);
+
         // Hide mouse over framebuffer
         // When using 'on_hover_and_drag_cursor' on the widget, the cursor still shows when the
         // mouse button is down, which is why this is done here.
-        if self.ui_active
-            && self.emu.is_running()
-            && (self.get_machine_mouse_pos(ctx).is_some()
-                || (self.in_fullscreen && self.emu.is_mouse_relative()))
-        {
+        // Note that with capture enabled the cursor stays visible until the mouse is
+        // grabbed, so it is clear that clicking is what hands the mouse to the machine.
+        if self.ui_active && self.emu.is_running() && self.mouse_input_active(ctx) {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
 
@@ -3947,6 +4177,8 @@ impl eframe::App for SnowGui {
             return;
         }
 
+        let was_grabbed = self.mouse_grabbed;
+
         for event in &raw_input.events {
             match event {
                 egui::Event::PointerButton {
@@ -3954,15 +4186,42 @@ impl eframe::App for SnowGui {
                     pressed,
                     ..
                 } => {
-                    if self.get_machine_mouse_pos(ctx).is_some()
-                        || (self.in_fullscreen && self.emu.is_mouse_relative())
-                    {
-                        // Cursor is within framebuffer view area
-                        self.emu.update_mouse_button(*pressed);
+                    if *pressed {
+                        if !self.mouse_grabbed
+                            && self.can_grab_mouse()
+                            && (self.get_machine_mouse_pos(ctx).is_some() || self.in_fullscreen)
+                        {
+                            // Clicking the framebuffer grabs the mouse.
+                            // The click that enters capture mode is not passed
+                            // to the emulator.
+                            self.grab_mouse(ctx);
+                        } else if self.mouse_input_active(ctx) {
+                            self.mouse_button_down = true;
+                            self.emu.update_mouse_button(true);
+                            self.on_user_input();
+                        }
+                    } else if self.mouse_button_down {
+                        // Only release the machine's button if it was pressed down by us,
+                        // and always do so, even if the mouse has since left the
+                        // framebuffer or the grab was dropped. Otherwise the button would
+                        // be stuck down.
+                        self.mouse_button_down = false;
+                        self.emu.update_mouse_button(false);
                         self.on_user_input();
                     }
                 }
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    ..
+                } if self.mouse_grabbed => {
+                    self.release_mouse_grab();
+                }
                 egui::Event::MouseMoved(rel_p) => {
+                    if !self.mouse_input_active(ctx) {
+                        continue;
+                    }
+
                     // Event with relative motion, but 'optional' according to egui docs
                     let relpos = if self.in_fullscreen {
                         // In fullscreen mode, do not scale the mouse as the pointer cannot leave
@@ -3977,32 +4236,51 @@ impl eframe::App for SnowGui {
                             y: (rel_p.y / self.framebuffer.scale) * 2.0,
                         }
                     };
+                    let relpos = self.apply_mouse_speed(relpos);
 
-                    if let Some(abs_p) = self.get_machine_mouse_pos(ctx) {
-                        // Cursor is within framebuffer view area
-                        self.emu.update_mouse(Some(&abs_p), &relpos);
-                        self.on_user_input();
-                    } else if self.in_fullscreen {
-                        // Always send relative motion for the entire screen in
-                        // fullscreen mode
-                        self.emu.update_mouse(None, &relpos);
-                        self.on_user_input();
-                    }
+                    let abs_p = if self.mouse_grabbed {
+                        None
+                    } else {
+                        self.get_machine_mouse_pos(ctx)
+                    };
+                    self.emu.update_mouse(abs_p.as_ref(), &relpos);
+                    self.on_user_input();
                 }
                 egui::Event::PointerMoved(_) => {
+                    if !self.mouse_input_active(ctx) {
+                        continue;
+                    }
+
                     // No relative motion in this event
                     if let Some(abs_p) = self.get_machine_mouse_pos(ctx) {
                         // Cursor is within framebuffer view area
-                        // No relative motion in this event
                         self.emu.update_mouse(Some(&abs_p), &egui::Pos2::default());
                         self.on_user_input();
                     }
                 }
                 egui::Event::WindowFocused(false) => {
                     self.emu.release_all_inputs();
+                    self.mouse_button_down = false;
+                    self.release_mouse_grab();
                 }
                 _ => (),
             }
+        }
+
+        if was_grabbed {
+            // While the mouse is grabbed the pointer belongs to the machine, so keep egui
+            // from reacting to it.
+            raw_input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::MouseMoved(_)
+                        | egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            ..
+                        }
+                )
+            });
         }
     }
 }

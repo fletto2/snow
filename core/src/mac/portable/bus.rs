@@ -5,10 +5,11 @@ use super::normandy::Normandy;
 use super::pmgr::Pmgr;
 use super::via::Via;
 use super::video::Video;
-use crate::bus::{Address, Bus, BusMember, BusResult, InspectableBus, IrqSource};
+use crate::bus::access::{Bus68000, BusAccess, BusResponse, bus_access_byte_lane, bus_access_word};
+use crate::bus::{Address, Bus, BusMember, InspectableBus, IrqSource};
 use crate::debuggable::Debuggable;
-use crate::emulator::MouseMode;
 use crate::emulator::comm::EmulatorSpeed;
+use crate::emulator::{EmuContext, MouseMode};
 use crate::keymap::KeyEvent;
 use crate::mac::MacModel;
 use crate::mac::adb::{AdbEvent, AdbKeyboard, AdbMouse};
@@ -17,6 +18,7 @@ use crate::mac::rtc::Rtc;
 use crate::mac::scc::Scc;
 use crate::mac::scsi::controller::ScsiController;
 use crate::mac::swim::Swim;
+use crate::mac::via_common::{LineState, ViaLine};
 use crate::renderer::{
     AUDIO_BUFFER_SAMPLES, AUDIO_CHANNELS, AudioProvider, Renderer, null_audio_sink,
 };
@@ -32,7 +34,51 @@ use serde::{Deserialize, Serialize};
 /// Size of a RAM page in MacBus::ram_dirty
 pub const RAM_DIRTY_PAGESIZE: usize = 256;
 
-pub const CLOCK_SPEED: Ticks = 16_000_000;
+/// Wait states of the static RAM
+const RAM_WAITS: Ticks = 1;
+/// Wait states of the ROM
+const ROM_WAITS: Ticks = 2;
+
+/// Frequency of the bus of the real hardware, without overclocking: C16M,
+/// which the CPU runs at
+const BUS_FREQUENCY: Ticks = 15_667_200;
+
+/// Frequency of the master clock (C16M) the ASC clock is derived from
+const C16M_FREQUENCY: Ticks = 15_667_200;
+
+/// Time the SCC needs between accesses (1.8us)
+const SCC_RECOVERY: Ticks = BUS_FREQUENCY * 18 / 10_000_000;
+
+/// Size of the blocks of the address map
+const MAP_BLOCK_SHIFT: u32 = 16;
+const MAP_BLOCKS: usize = 1 << (24 - MAP_BLOCK_SHIFT);
+
+/// What answers in a block of the address map
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Region {
+    None,
+    Ram,
+    /// Writes ignored
+    Rom,
+    /// ROM on reads, RAM on writes
+    RomOverRam,
+    /// Reads unimplemented, writes ignored
+    Ignored,
+    /// SLIM ROM, writes ignored
+    SlimRom,
+    Normandy,
+    Swim,
+    Via,
+    /// Test software region / extension ROM
+    ExtRom,
+    Scsi,
+    Video,
+    Asc,
+    Scc,
+}
+
+/// Address map: the region of each block, with the boot overlay off and on
+type AddressMap = [[Region; MAP_BLOCKS]; 2];
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -52,7 +98,14 @@ pub struct MacPortableBus<TRenderer: Renderer> {
 
     pub(crate) via: Via,
     via_clock: Ticks,
+    /// A VIA cycle is stalled up to the edge of the VIA clock, until the CPU
+    /// presents it again. Not saved, as a cycle is never in progress between
+    /// instructions.
+    #[serde(skip)]
+    via_stalled: bool,
     pub(crate) scc: Scc,
+    /// Bus time the SCC can be accessed again
+    scc_ready: Ticks,
     pub(crate) video: Video<TRenderer>,
     pub(crate) asc: Asc,
     asc_clock: Ticks,
@@ -64,8 +117,14 @@ pub struct MacPortableBus<TRenderer: Renderer> {
 
     overlay: bool,
 
+    #[serde(skip, default = "empty_map")]
+    map: AddressMap,
+
     /// Emulation speed setting
     pub(crate) speed: EmulatorSpeed,
+
+    /// Frequency of the bus, which includes any overclocking
+    act_bus_frequency: Ticks,
 
     /// Last vblank time (for syncing to video)
     /// Not serializing this because it is only used for determining how long to
@@ -142,18 +201,22 @@ where
             extension_rom: extension_rom.map(Vec::from).unwrap_or_default(),
             ram: vec![0; ram_size],
             ram_dirty: BitSet::from_iter(0..(ram_size / RAM_DIRTY_PAGESIZE)),
-            via: Via::new(),
+            via: Via::new(BUS_FREQUENCY),
             via_clock: 0,
+            via_stalled: false,
             video: Video::new(renderer),
             scc: Scc::new(),
-            swim: Swim::new(model.fdd_drives(), model.fdd_hd(), 16_000_000),
+            scc_ready: 0,
+            swim: Swim::new(model.fdd_drives(), model.fdd_hd(), BUS_FREQUENCY),
             scsi: ScsiController::new(),
             asc: Asc::default(),
             asc_clock: 0,
             mouse_ready: false,
 
             overlay: true,
+            map: build_map(model),
             speed: EmulatorSpeed::Accurate,
+            act_bus_frequency: BUS_FREQUENCY,
             vblank_time: Instant::now(),
             vblank_clock: 0,
             progkey_pressed: LatchingEvent::default(),
@@ -176,6 +239,7 @@ where
 
     /// Reinstalls things that can't be serialized and does some updates upon deserialization
     pub fn after_deserialize(&mut self, _renderer: TRenderer) {
+        self.map = build_map(self.model);
         self.asc.after_deserialize();
 
         // Mark all RAM pages as dirty after deserialization to update memory display
@@ -222,162 +286,192 @@ where
         T::from_u32(u32::from_be_bytes(tmp)).unwrap()
     }
 
-    fn write_overlay(&mut self, addr: Address, val: Byte) -> Option<()> {
-        match addr {
-            // ROM (disables overlay
-            0x0090_0000..=0x009F_FFFF => {
-                self.overlay = false;
-                self.write_normal(addr, val)
-            }
-            _ => self.write_normal(addr, val),
+    /// Ends the boot overlay on an access to the normal location of the ROM
+    fn end_overlay(&mut self, addr: Address) {
+        if (0x0090_0000..=0x009F_FFFF).contains(&addr) {
+            self.overlay = false;
         }
     }
 
-    fn write_normal(&mut self, addr: Address, val: Byte) -> Option<()> {
-        match addr {
-            // RAM
-            0x0000_0000..=0x008F_FFFF => self.normal_ram_write(addr, val),
-            // ROM, or Remapped RAM for 15MB RAM Mod
-            0x0090_0000..=0x009F_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_write(addr, val)
-                } else {
-                    Some(())
-                }
-            }
-            // ROM Disks, or Remapped RAM for 15MB RAM Mod
-            0x00A0_0000..=0x00DF_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_write(addr, val)
-                } else {
-                    Some(())
-                }
-            }
-            // SLIM ROM, or Remapped RAM for 15MB RAM Mod
-            0x00E0_0000..=0x00EF_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_write(addr, val)
-                } else {
-                    Some(())
-                }
-            }
-            // SLIM/Normandy, or Remapped ROM for 15MB RAM Mod
-            0x00F0_0000..=0x00F0_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_write(addr, val)
-                } else {
-                    self.normandy.write(addr, val)
-                }
-            }
-            // Remapped ROM for 15MB RAM Mod
-            0x00F1_0000..=0x00F3_FFFF => Some(()),
-            // SWIM
-            0x00F6_0000..=0x00F6_FFFF => self.swim.write(addr, val),
-            // VIA
-            0x00F7_0000..=0x00F7_FFFF => self.via.write(addr, val),
-            // SCSI
-            0x00F9_0000..=0x00F9_FFFF => self.scsi.write(addr, val),
-            // Video
-            0x00FA_0000..=0x00FA_FFFF => {
-                let offset = (addr & 0x7FFF) as usize;
-                Some(self.video.framebuffer[offset] = val)
-            }
-            // Sound
-            0x00FB_0000..=0x00FB_FFFF => self.asc.write(addr & 0xFFF, val),
-            // Normandy registers
-            0x00FC_0000..=0x00FC_FFFF => self.normandy.write(addr, val),
-            // SCC
-            0x00FD_0000..=0x00FD_FFFF => self.scc.write(addr >> 1, val),
-            // Normandy registers
-            0x00FE_0000..=0x00FE_FFFF => self.normandy.write(addr, val),
-            _ => None,
-        }
+    fn region(&self, addr: Address) -> Region {
+        self.map[usize::from(self.overlay)][(addr >> MAP_BLOCK_SHIFT) as usize]
     }
 
-    fn read_overlay(&mut self, addr: Address) -> Option<Byte> {
-        match addr {
-            0x0000_0000..=0x000F_FFFF => {
+    fn read_byte(&mut self, region: Region, addr: Address) -> Option<Byte> {
+        match region {
+            Region::Ram => self.normal_ram_read(addr),
+            Region::Rom | Region::RomOverRam => {
                 Some(*self.rom.get(addr as usize & self.rom_mask).unwrap_or(&0xFF))
             }
-            0x0090_0000..=0x009F_FFFF => {
-                self.overlay = false;
-                self.read_normal(addr)
-            }
-            _ => self.read_normal(addr),
-        }
-    }
-
-    fn read_normal(&mut self, addr: Address) -> Option<Byte> {
-        match addr {
-            0x0000_0000..=0x008F_FFFF => self.normal_ram_read(addr),
-            // ROM, or Remapped RAM for 15MB RAM Mod
-            0x0090_0000..=0x009F_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_read(addr)
-                } else {
-                    Some(*self.rom.get(addr as usize & self.rom_mask).unwrap_or(&0xFF))
-                }
-            }
-            // ROM Disks, or Remapped RAM for 15MB RAM Mod
-            0x00A0_0000..=0x00DF_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_read(addr)
-                } else {
-                    None
-                }
-            }
-            // SLIM ROM, or Remapped RAM for 15MB RAM Mod
-            0x00E0_0000..=0x00EF_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    self.normal_ram_read(addr)
-                } else {
-                    self.normandy.read(addr)
-                }
-            }
-            // SLIM/Normandy, or Remapped ROM for 15MB RAM Mod
-            0x00F0_0000..=0x00F0_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    Some(*self.rom.get(addr as usize & self.rom_mask).unwrap_or(&0xFF))
-                } else {
-                    self.normandy.read(addr)
-                }
-            }
-            // Remapped ROM for 15MB RAM Mod
-            0x00F1_0000..=0x00F3_FFFF => {
-                if self.model == MacModel::Portable15MB {
-                    Some(*self.rom.get(addr as usize & self.rom_mask).unwrap_or(&0xFF))
-                } else {
-                    None
-                }
-            }
-            // SWIM
-            0x00F6_0000..=0x00F6_FFFF => self.swim.read(addr),
-            // VIA
-            0x00F7_0000..=0x00F7_FFFF => self.via.read(addr),
-            // Test software region / extension ROM
-            0x00F8_0000..=0x00F8_FFFF => Some(
+            Region::SlimRom => self.normandy.read(addr),
+            Region::ExtRom => Some(
                 *self
                     .extension_rom
                     .get((addr - 0xF8_0000) as usize)
                     .unwrap_or(&0xFF),
             ),
-            // SCSI
-            0x00F9_0000..=0x00F9_FFFF => self.scsi.read(addr),
-            // Video
-            0x00FA_0000..=0x00FA_FFFF => {
-                let offset = (addr & 0x7FFF) as usize;
-                Some(self.video.framebuffer[offset])
-            }
-            // Sound
-            0x00FB_0000..=0x00FB_FFFF => self.asc.read(addr & 0xFFF),
-            // Normandy registers
-            0x00FC_0000..=0x00FC_FFFF => self.normandy.read(addr),
-            // SCC
-            0x00FD_0000..=0x00FD_FFFF => self.scc.read(addr >> 1),
-            // Normandy registers
-            0x00FE_0000..=0x00FE_FFFF => self.normandy.read(addr),
+            Region::Video => Some(self.video.framebuffer[(addr & 0x7FFF) as usize]),
             _ => None,
         }
+    }
+
+    fn write_byte(&mut self, region: Region, addr: Address, val: Byte) -> Option<()> {
+        match region {
+            Region::Ram | Region::RomOverRam => self.normal_ram_write(addr, val),
+            Region::Rom | Region::Ignored | Region::SlimRom => Some(()),
+            Region::Video => Some(self.video.framebuffer[(addr & 0x7FFF) as usize] = val),
+            _ => None,
+        }
+    }
+
+    fn swim_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.swim.read(addr).map(u32::from)
+    }
+
+    fn swim_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.swim.write(addr, val as Byte)
+    }
+
+    fn via_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.via.read(addr).map(u32::from)
+    }
+
+    fn via_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.via.write(addr, val as Byte)?;
+        // The SWIM SEL line is the VIA's PB5 pin
+        self.swim.sel = self.via.pb().headsel();
+        Some(())
+    }
+
+    fn scsi_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.scsi.read(addr).map(u32::from)
+    }
+
+    fn scsi_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.scsi.write(addr, val as Byte)
+    }
+
+    fn scc_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.scc.read(addr >> 1).map(u32::from)
+    }
+
+    fn scc_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.scc.write(addr >> 1, val as Byte)
+    }
+
+    fn normandy_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.normandy.read(addr).map(u32::from)
+    }
+
+    fn normandy_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.normandy.write(addr, val as Byte)
+    }
+
+    /// The SCC is on the upper byte lane, A/B on A1 and D/C on A2. The GLU
+    /// holds off an access until it has had the time it needs since the
+    /// previous one.
+    ///
+    /// The GLU makes its /RD and /WR from A15 too: reads are documented at
+    /// $FD0000 and writes at $FD8000. What an access to the other half does
+    /// isn't, so the SCC is read on reads and written on writes anywhere.
+    fn scc_cycle(&mut self, acc: BusAccess<Bus68000>) -> BusResponse {
+        let now = self.cycles + acc.pending;
+        let waits = self.scc_ready.saturating_sub(now);
+        // The access itself takes 4 clocks
+        self.scc_ready = now + waits + 4 + SCC_RECOVERY;
+        bus_access_byte_lane::<2, 0, _, _>(acc, waits, self, Self::scc_read, Self::scc_write)
+    }
+
+    /// The VIA is on the upper byte lane, at even addresses. It is clocked
+    /// at C16M / 20 by the GLU, which also makes its chip select and /DTACK
+    /// (the CPU's E clock and /VMA only go to the expansion connector), so
+    /// an access is synchronous with the VIA clock: it starts on its next
+    /// edge and lasts half a VIA clock cycle, as on the Mac II. The cycle is
+    /// stalled up to that edge, with the bus ticked through it, for the VIA
+    /// to be accessed in its state at that time.
+    fn via_cycle(&mut self, acc: BusAccess<Bus68000>) -> Result<BusResponse> {
+        if !self.via_stalled {
+            self.via_stalled = true;
+            return Ok(BusResponse::Stall(20 - (self.via_clock + acc.pending) % 20));
+        }
+        self.via_stalled = false;
+
+        // Half a VIA clock cycle, less the 4 clocks of the bus cycle
+        let waits = 10 - 4;
+        Ok(bus_access_byte_lane::<2, 0, _, _>(
+            acc,
+            waits,
+            self,
+            Self::via_read,
+            Self::via_write,
+        ))
+    }
+
+    /// The ASC is on the upper byte lane with /UDS as its A0, and a buffer
+    /// copies its lane to the lower one on reads with /LDS. A byte access
+    /// reaches the register at its address, a word access the register at
+    /// the even address, the byte on both halves on reads.
+    fn asc_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        let val = u32::from(self.asc.read(addr & 0xFFF)?);
+        Some(if len == 2 { val * 0x0101 } else { val })
+    }
+
+    fn asc_write(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        // The upper byte on a word write
+        let val = (val >> (8 * (len - 1))) as Byte;
+        self.asc.write(addr & 0xFFF, val)
+    }
+
+    /// Reads the bytes of a cycle one at a time, as the byte interface did
+    fn read_bytes(&mut self, region: Region, addr: Address, len: u32) -> u32 {
+        (addr..addr + len).fold(0, |v, a| {
+            let val = self.read_byte(region, a).unwrap_or_else(|| {
+                warn!("Read from unimplemented address: {:08X}", a);
+                Self::OPENBUS
+            });
+            (v << 8) | u32::from(val)
+        })
+    }
+
+    /// Writes the bytes of a cycle one at a time, as the byte interface did
+    fn write_bytes(&mut self, region: Region, addr: Address, len: u32, val: u32) {
+        for a in addr..addr + len {
+            let val = (val >> (8 * (addr + len - 1 - a))) as Byte;
+            if self.write_byte(region, a, val).is_none() {
+                warn!("Write to unimplemented address: {:08X} {:02X}", a, val);
+            }
+        }
+    }
+
+    // RAM and ROM a word at a time: a word is at an even address, so its
+    // bytes are both in or both out of the RAM, and in the same page
+
+    fn ram_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        let idx = addr as usize;
+        Some(match self.ram.get(idx..idx + len as usize) {
+            Some(&[hi, lo]) => u32::from(u16::from_be_bytes([hi, lo])),
+            Some(&[b]) => u32::from(b),
+            _ => 0,
+        })
+    }
+
+    fn ram_write(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        let idx = addr as usize;
+        let bytes = &(val as u16).to_be_bytes()[2 - len as usize..];
+        if let Some(ram) = self.ram.get_mut(idx..idx + bytes.len()) {
+            ram.copy_from_slice(bytes);
+            self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+        }
+        Some(())
+    }
+
+    fn rom_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        let idx = addr as usize & self.rom_mask;
+        Some(match self.rom.get(idx..idx + len as usize) {
+            Some(&[hi, lo]) => u32::from(u16::from_be_bytes([hi, lo])),
+            Some(&[b]) => u32::from(b),
+            _ => self.read_bytes(Region::Rom, addr, len),
+        })
     }
 
     fn normal_ram_write(&mut self, addr: Address, val: Byte) -> Option<()> {
@@ -470,16 +564,33 @@ where
         self.speed = speed;
     }
 
+    /// Frequency of the bus of the real hardware, without overclocking
+    #[inline(always)]
+    pub const fn bus_frequency(&self) -> Ticks {
+        BUS_FREQUENCY
+    }
+
+    /// Sets the frequency of the bus, or goes back to the one of the real
+    /// hardware
+    pub fn set_overclock(&mut self, bus_frequency: Option<u64>) {
+        self.act_bus_frequency = bus_frequency.unwrap_or_else(|| self.bus_frequency());
+    }
+
     pub fn set_mouse_mode(&mut self, mode: MouseMode) {
         self.mouse_mode = mode;
     }
 
-    /// Tests for wait states on bus access
-    fn in_waitstate(&mut self, addr: Address) -> bool {
-        match addr {
-            0x0000_0000..=0x009F_FFFF => self.normandy.waitstate(addr),
-            _ => false,
-        }
+    /// Wait states of a bus cycle
+    fn wait_states(&self, region: Region, acc: &BusAccess<Bus68000>) -> Ticks {
+        let memory = match region {
+            Region::Ram => RAM_WAITS,
+            Region::RomOverRam if acc.write => RAM_WAITS,
+            Region::Rom | Region::RomOverRam => ROM_WAITS,
+            _ => return 0,
+        };
+        self.normandy
+            .wait_states(acc.addr, acc.size)
+            .unwrap_or(memory)
     }
 
     /// Programmer's key pressed
@@ -508,47 +619,79 @@ impl<TRenderer> Bus<Address, Byte> for MacPortableBus<TRenderer>
 where
     TRenderer: Renderer,
 {
-    fn read(&mut self, addr: Address) -> BusResult<Byte> {
-        if self.in_waitstate(addr) {
-            return BusResult::WaitState;
-        }
-
-        let val = if self.overlay {
-            self.read_overlay(addr)
-        } else {
-            self.read_normal(addr)
-        };
-
-        if let Some(v) = val {
-            BusResult::Ok(v)
-        } else {
-            warn!("Read from unimplemented address: {:08X}", addr);
-            BusResult::Ok(Self::OPENBUS)
-        }
-    }
-
-    fn write(&mut self, addr: Address, val: Byte) -> BusResult<Byte> {
-        if self.in_waitstate(addr) {
-            return BusResult::WaitState;
-        }
-
-        let written = if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_normal(addr, val)
-        };
-
-        // Sync values that live in multiple places
-        self.swim.sel = self.via.b_out.headsel();
-
-        if written.is_none() {
-            warn!("Write to unimplemented address: {:08X} {:02X}", addr, val);
-        }
-        BusResult::Ok(val)
-    }
+    type Cpu = Bus68000;
 
     fn get_mask(&self) -> Address {
         0x00FFFFFF
+    }
+
+    #[inline(always)]
+    fn access(&mut self, acc: BusAccess<Bus68000>) -> Result<BusResponse> {
+        self.end_overlay(acc.addr);
+        let region = self.region(acc.addr);
+        let waits = self.wait_states(region, &acc);
+        let resp = match region {
+            // On the lower byte lane, at odd addresses
+            Region::Swim => bus_access_byte_lane::<2, 1, _, _>(
+                acc,
+                waits,
+                self,
+                Self::swim_read,
+                Self::swim_write,
+            ),
+            Region::Via => self.via_cycle(acc)?,
+            // On the upper byte lane, its /IOR and /IOW decoded by the GLU
+            Region::Scsi => bus_access_byte_lane::<2, 0, _, _>(
+                acc,
+                waits,
+                self,
+                Self::scsi_read,
+                Self::scsi_write,
+            ),
+            Region::Scc => self.scc_cycle(acc),
+            // The CPU GLU only has D0-D3: on the lower byte lane
+            Region::Normandy => bus_access_byte_lane::<2, 1, _, _>(
+                acc,
+                waits,
+                self,
+                Self::normandy_read,
+                Self::normandy_write,
+            ),
+            Region::Asc => bus_access_word(acc, waits, self, Self::asc_read, Self::asc_write),
+            Region::Ram => bus_access_word(acc, waits, self, Self::ram_read, Self::ram_write),
+            Region::Rom => bus_access_word(acc, waits, self, Self::rom_read, |_, _, _, _| Some(())),
+            _ => bus_access_word(
+                acc,
+                waits,
+                self,
+                |bus, addr, len| Some(bus.read_bytes(region, addr, len)),
+                |bus, addr, len, val| {
+                    bus.write_bytes(region, addr, len, val);
+                    Some(())
+                },
+            ),
+        };
+        let (data, waits) = match resp {
+            BusResponse::Ack { data, waits, .. } => (data, waits),
+            BusResponse::Stall(_) => return Ok(resp),
+            BusResponse::BusError if acc.write => {
+                warn!(
+                    "Write to unimplemented address: {:08X} {:02X}",
+                    acc.addr, acc.data
+                );
+                (0, waits)
+            }
+            BusResponse::BusError => {
+                warn!("Read from unimplemented address: {:08X}", acc.addr);
+                (Self::OPENBUS.into(), waits)
+            }
+        };
+
+        Ok(BusResponse::Ack {
+            width: 2,
+            data,
+            waits,
+        })
     }
 
     fn reset(&mut self, hard: bool) -> Result<bool> {
@@ -566,6 +709,7 @@ where
 
         self.scc = Scc::new();
         self.via.reset();
+        self.swim.sel = self.via.pb().headsel();
         self.asc.reset();
         self.mouse_ready = false;
         self.overlay = true;
@@ -575,14 +719,18 @@ where
     fn cpu_tick(&mut self, ticks: Ticks) -> Result<()> {
         // This is called from the CPU per bus access (fine-grained).
         // The power manager needs accuracy beyond instruction granularity.
-        self.pmgr.a_out = self.via.a_out.0;
+        self.pmgr.a_out = self.via.pa().0;
         self.pmgr.a_in = self.via.a_in.0;
-        self.pmgr.pmreq = self.via.b_out.pmreq();
-        self.pmgr.onesec = self.via.ifr.onesec();
+        self.pmgr.pmreq = self.via.pb().pmreq();
         self.pmgr.tick(ticks, ())?;
         self.via.b_in.set_pmack(self.pmgr.pmack);
         self.via.a_in.0 = self.pmgr.a_in;
-        self.via.ifr.set_pmgr(self.pmgr.interrupt);
+        if self.pmgr.take_pmint() {
+            self.via.set_line(ViaLine::CB1, LineState::Pulse);
+        }
+        if self.pmgr.take_onesec() {
+            self.via.set_line(ViaLine::CA2, LineState::Pulse);
+        }
 
         Ok(())
     }
@@ -593,23 +741,43 @@ where
     TRenderer: Renderer,
 {
     fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
+        struct BusEmuContext {
+            speed: EmulatorSpeed,
+            bus_frequency: Ticks,
+        }
+
+        impl EmuContext for BusEmuContext {
+            fn speed(&self) -> EmulatorSpeed {
+                self.speed
+            }
+
+            fn bus_frequency(&self) -> Ticks {
+                self.bus_frequency
+            }
+        }
+
+        let ctx = &BusEmuContext {
+            speed: self.speed,
+            bus_frequency: self.act_bus_frequency,
+        };
+
         self.cycles += ticks;
 
         self.via_clock += ticks;
         while self.via_clock >= 20 {
-            // TODO VIA wait states
             self.via_clock -= 20;
 
-            self.via.tick(1, ())?;
+            self.via.tick(1, ctx)?;
         }
 
-        self.video.tick(ticks, ())?;
+        self.video.tick(ticks, ctx)?;
 
         // Legacy VBlank interrupt
         self.vblank_clock += ticks;
-        while self.vblank_clock >= CLOCK_SPEED / 60 {
-            self.vblank_clock -= CLOCK_SPEED / 60;
-            self.via.ifr.set_vblank(true);
+        while self.vblank_clock >= self.act_bus_frequency / 60 {
+            self.vblank_clock -= self.act_bus_frequency / 60;
+            self.via.set_line(ViaLine::CA1, LineState::Pulse);
+            self.pmgr.tick_60hz();
 
             if self.speed == EmulatorSpeed::Video {
                 // Sync to 60 fps video
@@ -624,14 +792,14 @@ where
             }
         }
 
-        self.asc_clock += ticks;
-        while self.asc_clock >= CLOCK_SPEED / self.asc.sample_rate() {
-            self.asc_clock -= CLOCK_SPEED / self.asc.sample_rate();
+        self.asc_clock += ticks * C16M_FREQUENCY;
+        while self.asc_clock >= self.asc.sample_period() * self.act_bus_frequency {
+            self.asc_clock -= self.asc.sample_period() * self.act_bus_frequency;
 
             self.asc.tick(self.speed == EmulatorSpeed::Accurate)?;
         }
 
-        self.swim.intdrive = self.via.b_out.drivesel();
+        self.swim.intdrive = self.via.pb().drivesel();
         self.swim.tick(ticks, ())?;
 
         Ok(ticks)
@@ -649,7 +817,7 @@ where
         if self.scc.get_irq() | self.asc.get_irq() {
             return Some(2);
         }
-        if self.via.ifr.0 & self.via.ier.0 != 0 {
+        if self.via.irq() {
             return Some(1);
         }
         None
@@ -662,23 +830,59 @@ where
 {
     fn inspect_read(&mut self, addr: Address) -> Option<Byte> {
         if addr >= 0x00F0_0000 {
-            None
-        } else if self.overlay {
-            self.read_overlay(addr)
-        } else {
-            self.read_normal(addr)
+            return None;
         }
+        self.end_overlay(addr);
+        self.read_byte(self.region(addr), addr)
     }
 
     fn inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> {
         if addr >= 0x00F0_0000 {
-            None
-        } else if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_normal(addr, val)
+            return None;
         }
+        self.end_overlay(addr);
+        self.write_byte(self.region(addr), addr, val)
     }
+}
+
+fn region(model: MacModel, overlay: bool, addr: Address) -> Region {
+    // The 15MB RAM mod remaps RAM and the ROM
+    let ram15 = model == MacModel::Portable15MB;
+    match addr {
+        // ROM in place of the RAM during the boot overlay
+        0x0000_0000..=0x000F_FFFF if overlay => Region::RomOverRam,
+        0x0000_0000..=0x008F_FFFF => Region::Ram,
+        0x0090_0000..=0x00EF_FFFF if ram15 => Region::Ram,
+        0x0090_0000..=0x009F_FFFF => Region::Rom,
+        // ROM disks
+        0x00A0_0000..=0x00DF_FFFF => Region::Ignored,
+        0x00E0_0000..=0x00EF_FFFF => Region::SlimRom,
+        0x00F0_0000..=0x00F0_FFFF if ram15 => Region::RomOverRam,
+        0x00F0_0000..=0x00F0_FFFF => Region::Normandy,
+        0x00F1_0000..=0x00F3_FFFF if ram15 => Region::Rom,
+        0x00F1_0000..=0x00F3_FFFF => Region::Ignored,
+        0x00F6_0000..=0x00F6_FFFF => Region::Swim,
+        0x00F7_0000..=0x00F7_FFFF => Region::Via,
+        0x00F8_0000..=0x00F8_FFFF => Region::ExtRom,
+        0x00F9_0000..=0x00F9_FFFF => Region::Scsi,
+        0x00FA_0000..=0x00FA_FFFF => Region::Video,
+        0x00FB_0000..=0x00FB_FFFF => Region::Asc,
+        0x00FC_0000..=0x00FC_FFFF | 0x00FE_0000..=0x00FE_FFFF => Region::Normandy,
+        0x00FD_0000..=0x00FD_FFFF => Region::Scc,
+        _ => Region::None,
+    }
+}
+
+fn build_map(model: MacModel) -> AddressMap {
+    std::array::from_fn(|overlay| {
+        std::array::from_fn(|block| {
+            region(model, overlay == 1, (block as Address) << MAP_BLOCK_SHIFT)
+        })
+    })
+}
+
+fn empty_map() -> AddressMap {
+    [[Region::None; MAP_BLOCKS]; 2]
 }
 
 impl<TRenderer> Debuggable for MacPortableBus<TRenderer>

@@ -40,10 +40,6 @@ pub struct Asc {
     /// Last sample played on right channel
     r_last: u8,
 
-    /// Countdown to generate IRQs only every FIFO_SIZE (empty) samples when
-    /// FIFO is empty
-    empty_cycles: Ticks,
-
     filter: AudioFilter,
 }
 
@@ -105,7 +101,6 @@ impl Default for Asc {
             ctrl: Control(0),
             l_last: 0,
             r_last: 0,
-            empty_cycles: 0,
             filter: AudioFilter::new(),
         }
     }
@@ -119,7 +114,6 @@ impl Asc {
         self.fifo_l.clear();
         self.fifo_r.clear();
         self.wavetables.fill(0);
-        self.empty_cycles = 0;
         self.filter.reset();
     }
 
@@ -163,49 +157,33 @@ impl Asc {
             let table_offset = (c.phase.0 >> 15) & 0x1FF;
             sample += self.wavetables[i * 0x200 + table_offset as usize] as u16;
         }
-        ((sample >> 2) as u8, (sample >> 2) as u8)
+        self.l_last = (sample >> 2) as u8;
+        self.r_last = self.l_last;
+        (self.l_last, self.r_last)
     }
 
     /// Sample the ASC for FIFO mode
     fn sample_fifo(&mut self) -> (u8, u8) {
-        // If a FIFO is empty, the ASC will continue to output the last sample of that channel
+        // If a FIFO is empty, the ASC will continue to output the last sample of that channel.
+        // A FIFO interrupts once when a sample leaves it exactly half full. There is no
+        // interrupt when it runs empty.
         let l = self.fifo_l.pop_front().unwrap_or(self.l_last);
+        if self.fifo_l.len() == FIFO_SIZE / 2 {
+            self.fifo_status.set_l_half(true);
+            self.irq = true;
+        }
         let r = if self.ctrl.stereo() {
-            self.fifo_r.pop_front().unwrap_or(self.r_last)
+            let r = self.fifo_r.pop_front().unwrap_or(self.r_last);
+            if self.fifo_r.len() == FIFO_SIZE / 2 {
+                self.fifo_status.set_r_half(true);
+                self.irq = true;
+            }
+            r
         } else {
             l
         };
         self.l_last = l;
         self.r_last = r;
-
-        // Set FIFO status bits
-        if self.fifo_l.len() == FIFO_SIZE / 2 {
-            self.fifo_status.set_l_half(true);
-            self.irq = true;
-        }
-        if self.fifo_r.len() == FIFO_SIZE / 2 {
-            self.fifo_status.set_r_half(true);
-            self.irq = true;
-        }
-
-        if self.fifo_l.is_empty() && self.fifo_r.is_empty() {
-            // When outputting alert sounds, MacOS leaves the FIFO mode on and still expects IRQs,
-            // but too many will freeze the system. 'empty_cycles' will generate an IRQ once for
-            // every FIFO_SIZE (empty) samples.
-            if self.empty_cycles == 0 {
-                self.fifo_status = FifoStatus::default()
-                    .with_l_half(true)
-                    .with_r_half(true)
-                    .with_l_fullempty(true)
-                    .with_r_fullempty(true);
-                self.irq = true;
-                self.empty_cycles = FIFO_SIZE as Ticks;
-            } else {
-                self.empty_cycles -= 1;
-            }
-        } else {
-            self.empty_cycles = 0;
-        }
 
         (l, r)
     }
@@ -213,7 +191,8 @@ impl Asc {
     /// Ticks the ASC at the sample rate
     pub fn tick(&mut self, queue_sample: bool) -> Result<()> {
         let (l, r) = match self.mode {
-            AscMode::Off => (0, 0),
+            // The output holds the last sample of the previous mode
+            AscMode::Off => (self.l_last, self.r_last),
             AscMode::Fifo => self.sample_fifo(),
             AscMode::Wavetable => self.sample_wavetable(),
         };
@@ -224,9 +203,10 @@ impl Asc {
         Ok(())
     }
 
-    pub const fn sample_rate(&self) -> Ticks {
-        // TODO configurable sample rate
-        22257
+    /// Time between two samples, in cycles of C16M (15.6672 MHz): 22254.5
+    /// Hz, 35.2 VIA clock cycles, as ASCTester measures on a IIci
+    pub const fn sample_period(&self) -> Ticks {
+        704
     }
 
     pub fn set_sink(&mut self, sink: Box<dyn AudioSink>) {
@@ -273,21 +253,24 @@ impl BusMember<Address> for Asc {
 
     fn write(&mut self, addr: Address, val: u8) -> Option<()> {
         match addr {
+            // A FIFO interrupts once when a write fills it
             0x000..=0x3FF if self.mode == AscMode::Fifo => {
                 if self.fifo_l.len() < FIFO_SIZE {
                     self.fifo_l.push_back(val);
-                }
-                if self.fifo_l.len() == FIFO_SIZE {
-                    self.fifo_status.set_l_fullempty(true);
+                    if self.fifo_l.len() == FIFO_SIZE {
+                        self.fifo_status.set_l_fullempty(true);
+                        self.irq = true;
+                    }
                 }
                 Some(())
             }
             0x400..=0x7FF if self.mode == AscMode::Fifo => {
                 if self.fifo_r.len() < FIFO_SIZE {
                     self.fifo_r.push_back(val);
-                }
-                if self.fifo_r.len() == FIFO_SIZE {
-                    self.fifo_status.set_r_fullempty(true);
+                    if self.fifo_r.len() == FIFO_SIZE {
+                        self.fifo_status.set_r_fullempty(true);
+                        self.irq = true;
+                    }
                 }
                 Some(())
             }
@@ -307,13 +290,16 @@ impl BusMember<Address> for Asc {
                     // Clear FIFOs
                     self.fifo_l.clear();
                     self.fifo_r.clear();
-                    self.fifo_status.set_l_fullempty(true);
-                    self.fifo_status.set_r_fullempty(true);
                 }
                 Some(())
             }
-            // FIFO status
-            0x804 => Some(self.fifo_status.0 = val),
+            // FIFO status. Writing pending flags back raises the interrupt again, which
+            // SwapMMUMode on the Mac II relies on.
+            0x804 => {
+                self.fifo_status.0 = val;
+                self.irq |= val != 0;
+                Some(())
+            }
             // Clock rate
             0x807 => {
                 if val != 0 {
@@ -352,7 +338,111 @@ impl Debuggable for Asc {
             dbgprop_byte_bin!("FIFO status", self.fifo_status.0),
             dbgprop_udec!("FIFO L level", self.fifo_l.len()),
             dbgprop_udec!("FIFO R level", self.fifo_r.len()),
-            dbgprop_udec!("Empty cycles", self.empty_cycles),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tick(asc: &mut Asc, samples: usize) {
+        for _ in 0..samples {
+            asc.tick(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn fifo_irq_stereo() {
+        let mut asc = Asc::default();
+        asc.write(0x801, 1);
+        asc.write(0x802, 2);
+
+        // No interrupt with the FIFOs empty
+        tick(&mut asc, 4 * FIFO_SIZE);
+        assert!(!asc.get_irq());
+
+        // One interrupt when the FIFOs fill up
+        for _ in 0..FIFO_SIZE {
+            asc.write(0x000, 0x80);
+            asc.write(0x400, 0x80);
+        }
+        assert!(asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x0A));
+        assert!(!asc.get_irq());
+        asc.write(0x000, 0x80);
+        assert!(!asc.get_irq());
+
+        // One interrupt when they drain to half full
+        tick(&mut asc, FIFO_SIZE / 2 - 1);
+        assert!(!asc.get_irq());
+        tick(&mut asc, 1);
+        assert!(asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x05));
+
+        // None when they run empty
+        tick(&mut asc, FIFO_SIZE);
+        assert!(!asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x00));
+    }
+
+    #[test]
+    fn fifo_irq_mono() {
+        let mut asc = Asc::default();
+        asc.write(0x801, 1);
+
+        // One more than half full interrupts on the next sample. The second FIFO is not played
+        // in mono and does not interrupt.
+        for _ in 0..FIFO_SIZE / 2 + 1 {
+            asc.write(0x000, 0x80);
+            asc.write(0x400, 0x80);
+        }
+        tick(&mut asc, 1);
+        assert!(asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x01));
+        tick(&mut asc, FIFO_SIZE);
+        assert!(!asc.get_irq());
+    }
+
+    #[test]
+    fn fifo_irq_write_back() {
+        let mut asc = Asc::default();
+        asc.write(0x801, 1);
+        asc.write(0x802, 2);
+        for _ in 0..FIFO_SIZE / 2 + 1 {
+            asc.write(0x000, 0x80);
+            asc.write(0x400, 0x80);
+        }
+        tick(&mut asc, 1);
+
+        // Writing the flags back raises the interrupt again
+        let status = asc.read(0x804).unwrap();
+        assert_eq!(status, 0x05);
+        assert!(!asc.get_irq());
+        asc.write(0x804, status);
+        assert!(asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x05));
+        assert!(!asc.get_irq());
+
+        // Writing no flags does not
+        asc.write(0x804, 0);
+        assert!(!asc.get_irq());
+    }
+
+    #[test]
+    fn fifo_clear_flags() {
+        let mut asc = Asc::default();
+        asc.write(0x801, 1);
+        asc.write(0x802, 2);
+        for _ in 0..FIFO_SIZE / 2 {
+            asc.write(0x000, 0x80);
+            asc.write(0x400, 0x80);
+        }
+
+        // Clearing the FIFOs flags nothing, so nothing reads as full
+        asc.write(0x803, 0x80);
+        asc.write(0x803, 0);
+        assert!(!asc.get_irq());
+        assert_eq!(asc.read(0x804), Some(0x00));
     }
 }

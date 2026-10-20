@@ -1,24 +1,22 @@
 //! VIA implementation for the Macintosh Portable/PowerBook 100
 
+use std::ops::{Deref, DerefMut};
+
 use crate::bus::Address;
 use crate::bus::BusMember;
-use crate::debuggable::DebuggableProperty;
-use crate::debuggable::DebuggablePropertyValue;
 use crate::debuggable::{Debuggable, DebuggableProperties};
+use crate::emulator::EmuContext;
+use crate::mac::via_common::{ViaCommon, ViaReg, ViaWiring};
+use crate::tickable::TickConverter;
 use crate::tickable::{Tickable, Ticks};
-use crate::types::{Byte, Field16};
-use crate::{dbgprop_bool, dbgprop_byte_bin, dbgprop_group, dbgprop_udec, dbgprop_word};
+use crate::types::Byte;
 use anyhow::Result;
 use proc_bitfield::bitfield;
 use serde::{Deserialize, Serialize};
 
-/// Counter at which to trigger the one-second interrupt
-/// TODO
-const ONESEC_TICKS: Ticks = 783360;
-
 bitfield! {
     /// VIA Register A
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Copy, Serialize, Deserialize)]
     pub struct RegisterA(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
         pub pmd0: bool @ 0,
         pub pmd1: bool @ 1,
@@ -33,7 +31,7 @@ bitfield! {
 
 bitfield! {
     /// VIA Register B
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Copy, Serialize, Deserialize)]
     pub struct RegisterB(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
         pub pmreq: bool @ 0,
         pub pmack: bool @ 1,
@@ -48,41 +46,8 @@ bitfield! {
 }
 
 bitfield! {
-    /// VIA Auxilary Control Register
-    #[derive(Serialize, Deserialize)]
-    pub struct RegisterACR(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
-        /// Input latch register A
-        pub ralatch: bool @ 0,
-
-        /// Input latch register B
-        pub rblatch: bool @ 1,
-
-        /// Timer T2 interrupts
-        pub t2: bool @ 5,
-
-        /// Timer T1 interrupts
-        pub t1: u8 @ 6..=7,
-    }
-}
-
-bitfield! {
-    /// VIA Peripheral Control Register
-    #[derive(Serialize, Deserialize)]
-    pub struct RegisterPCR(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
-        /// VBlank/60.15Hz
-        pub vblank: bool @ 0,
-        /// One-second interrupt
-        pub onesec: u8 @ 1..=3,
-        /// Power manager interrupt
-        pub pmgr: bool @ 4,
-        /// SCSI IRQ interrupt
-        pub scsi_irq: u8 @ 5..=7,
-    }
-}
-
-bitfield! {
     /// VIA Interrupt flag/enable registers
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Copy, Serialize, Deserialize)]
     pub struct RegisterIRQ(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
         pub onesec: bool @ 0,
         pub vblank: bool @ 1,
@@ -94,321 +59,150 @@ bitfield! {
     }
 }
 
+pub struct PortableViaWiring;
+
+impl ViaWiring for PortableViaWiring {
+    type RegisterA = RegisterA;
+    type RegisterB = RegisterB;
+    type RegisterIRQ = RegisterIRQ;
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Via {
-    pub a_out: RegisterA,
-    pub a_in: RegisterA,
-    pub ddra: RegisterA,
-    pub b_out: RegisterB,
-    pub b_in: RegisterB,
-    pub ddrb: RegisterB,
-    pub ier: RegisterIRQ,
-    pub ifr: RegisterIRQ,
-    pub pcr: RegisterPCR,
-    pub acr: RegisterACR,
-    pub t2cnt: Field16,
-    pub t2latch: Field16,
+    core: ViaCommon<PortableViaWiring>,
 
-    onesec: Ticks,
-
-    t1_enable: bool,
-    t2_enable: bool,
-
-    pub t1cnt: Field16,
-    pub t1latch: Field16,
+    /// Runs the VIA at the speed of the bus of the real hardware, whatever
+    /// the bus frequency is: the VIA is used as a timer
+    bus_tick_converter: TickConverter,
 }
 
 impl Via {
-    pub fn new() -> Self {
+    pub fn new(bus_frequency: Ticks) -> Self {
         Self {
-            a_out: RegisterA(0),
-            b_out: RegisterB(0),
-            a_in: RegisterA(0xFF),
-            b_in: RegisterB(0xFF),
-            ddra: RegisterA(0),
-            ddrb: RegisterB(0),
-            ier: RegisterIRQ(0),
-            ifr: RegisterIRQ(0),
-            acr: RegisterACR(0),
-            pcr: RegisterPCR(0),
-
-            t2cnt: Field16(0),
-            t2latch: Field16(0),
-            t2_enable: false,
-
-            t1cnt: Field16(0),
-            t1latch: Field16(0),
-            t1_enable: false,
-
-            onesec: 0,
+            core: ViaCommon::new(),
+            bus_tick_converter: TickConverter::new(bus_frequency),
         }
     }
 
     pub fn reset(&mut self) {
-        self.a_out = RegisterA(0);
-        self.b_out = RegisterB(0);
-        self.a_in = RegisterA(0xFF);
-        self.b_in = RegisterB(0xFF);
-        self.ddra = RegisterA(0);
-        self.ddrb = RegisterB(0);
-        self.ier = RegisterIRQ(0);
-        self.ifr = RegisterIRQ(0);
-        self.acr = RegisterACR(0);
-        self.pcr = RegisterPCR(0);
+        self.core.reset();
+        self.core.a_in = RegisterA(0xFF);
+        self.core.b_in = RegisterB(0xFF);
+    }
+}
+
+impl Deref for Via {
+    type Target = ViaCommon<PortableViaWiring>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for Via {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
     }
 }
 
 impl BusMember<Address> for Via {
     fn read(&mut self, addr: Address) -> Option<Byte> {
-        match (addr >> 9) & 0xF {
-            // Timer 2 counter LSB
-            0x08 => {
-                self.ifr.set_t2(false);
-                Some(self.t2cnt.lsb())
-            }
-            // Timer 2 counter MSB
-            0x09 => Some(self.t2cnt.msb()),
+        let reg = ViaReg::from_addr(addr);
 
-            // Timer 1 counter LSB
-            0x04 => {
-                self.ifr.set_t1(false);
-                Some(self.t1cnt.lsb())
-            }
-            // timer 1 counter MSB
-            0x05 => Some(self.t1cnt.msb()),
-
-            // Timer 1 latch LSB
-            0x06 => Some(self.t1latch.lsb()),
-            // Timer 1 latch MSB
-            0x07 => Some(self.t1latch.msb()),
-
-            // Register B
-            0x00 => {
-                // The SCC write request bit is used for checking if there's data ready
-                // from the SCC in critical sections where SCC interrupts are disabled.
-                // Reporting 1 signals that there's no data ready.
-                self.b_in.set_sccwrreq(true);
-
-                Some((self.b_in.0 & !self.ddrb.0) | (self.b_out.0 & self.ddrb.0))
-            }
-
-            // Register B Data Direction
-            0x02 => Some(self.ddrb.0),
-
-            // Register A Data Direction
-            0x03 => Some(self.ddra.0),
-
-            // TODO
-            0x0A => None,
-
-            // Auxiliary Control Register
-            0x0B => Some(self.acr.0),
-
-            // Peripheral Control Register
-            0x0C => Some(self.pcr.0),
-
-            // Interrupt Flag Register
-            0x0D => {
-                let mut val = self.ifr.0 & 0x7F;
-                if self.ifr.0 & self.ier.0 != 0 {
-                    val |= 0x80;
-                }
-                Some(val)
-            }
-
-            // Interrupt Enable Register
-            0x0E => Some(self.ier.0 | 0x80),
-
-            // Register A
-            0x01 | 0x0F => {
-                self.ifr.set_vblank(false);
-                self.ifr.set_onesec(false);
-
-                Some((self.a_in.0 & !self.ddra.0) | (self.a_out.0 & self.ddra.0))
-            }
-            _ => None,
+        if reg == ViaReg::B {
+            // The SCC write request bit is used for checking if there's data ready
+            // from the SCC in critical sections where SCC interrupts are disabled.
+            // Reporting 1 signals that there's no data ready.
+            self.core.b_in.set_sccwrreq(true);
         }
+
+        Some(self.core.read(reg))
     }
 
     fn write(&mut self, addr: Address, val: Byte) -> Option<()> {
-        match (addr >> 9) & 0xF {
-            // Timer 2 counter LSB
-            0x08 => Some(self.t2latch.set_lsb(val)),
-
-            // Timer 2 counter MSB
-            0x09 => {
-                self.t2latch.set_msb(val);
-
-                // Clear interrupt flag
-                self.ifr.set_t2(false);
-
-                // Start timer
-                self.t2_enable = true;
-                self.t2cnt = self.t2latch;
-                Some(())
-            }
-
-            // Timer 1 counter LSB, Timer 1 latch LSB
-            0x04 | 0x06 => Some(self.t1latch.set_lsb(val)),
-
-            // Timer 1 latch MSB
-            0x07 => {
-                self.t1latch.set_msb(val);
-
-                // Clear interrupt flag
-                self.ifr.set_t1(false);
-
-                Some(())
-            }
-
-            // Timer 1 counter MSB
-            0x05 => {
-                self.t1latch.set_msb(val);
-                self.t1cnt.0 = self.t1latch.0;
-
-                // Clear interrupt flag
-                self.ifr.set_t1(false);
-
-                // Start timer
-                self.t1_enable = true;
-                Some(())
-            }
-
-            // TODO
-            0x0A => None,
-
-            // Register B
-            0x00 => {
-                self.b_out.0 = val;
-
-                Some(())
-            }
-
-            // Register B Data Direction
-            0x02 => Some(self.ddrb.0 = val),
-
-            // Register A Data Direction
-            0x03 => Some(self.ddra.0 = val),
-
-            // Auxiliary Control Register
-            0x0B => Some(self.acr.0 = val),
-
-            // Peripheral Control Register
-            0x0C => Some(self.pcr.0 = val),
-
-            // Interrupt Flag Register
-            0x0D => {
-                self.ifr.0 &= !(val & 0x7F);
-                Some(())
-            }
-
-            // Interrupt Enable Register
-            0x0E => {
-                let newflags = if val & 0x80 != 0 {
-                    // Enable
-                    RegisterIRQ(self.ier.0 | (val & 0x7F))
-                } else {
-                    // Disable
-                    RegisterIRQ(self.ier.0 & !(val & 0x7F))
-                };
-                self.ier = newflags;
-                Some(())
-            }
-
-            // Register A
-            0x01 | 0x0F => {
-                self.ifr.set_vblank(false);
-                self.ifr.set_onesec(false);
-
-                self.a_out.0 = val;
-                Some(())
-            }
-
-            _ => None,
-        }
+        self.core.write(ViaReg::from_addr(addr), val);
+        Some(())
     }
 }
 
-impl Tickable for Via {
-    fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
-        self.onesec += ticks;
-
-        if self.onesec >= ONESEC_TICKS {
-            self.onesec -= ONESEC_TICKS;
-            self.ifr.set_onesec(true);
-            // TODO self.rtc.second();
+impl Tickable<&dyn EmuContext> for Via {
+    fn tick(&mut self, ticks: Ticks, ctx: &dyn EmuContext) -> Result<Ticks> {
+        self.bus_tick_converter.add_a_ticks(ticks);
+        let via_ticks = self.bus_tick_converter.get_b_ticks(ctx.bus_frequency());
+        if via_ticks > 0 {
+            self.core.tick_timers(via_ticks)?;
+            self.bus_tick_converter
+                .subtract_b_ticks(via_ticks, ctx.bus_frequency());
         }
-        // Timer 1
-        let t1ovf;
-        (self.t1cnt.0, t1ovf) = self.t1cnt.overflowing_sub(ticks.try_into()?);
-
-        if t1ovf && self.t1_enable {
-            self.ifr.set_t1(true);
-            match self.acr.t1() {
-                // Single shot mode
-                0 | 2 => {
-                    self.t1_enable = false;
-                }
-                1 | 3 => {
-                    self.t1cnt.0 = self.t1latch.0;
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        // Timer 2
-        let t2ovf;
-        (self.t2cnt.0, t2ovf) = self.t2cnt.0.overflowing_sub(ticks.try_into()?);
-
-        if t2ovf && self.t2_enable {
-            self.t2_enable = false;
-            self.ifr.set_t2(true);
-        }
-
         Ok(ticks)
     }
 }
 
 impl Debuggable for Via {
     fn get_debug_properties(&self) -> DebuggableProperties {
-        vec![
-            dbgprop_group!(
-                "Register A",
-                vec![
-                    dbgprop_byte_bin!("DDRA", self.ddra.0),
-                    dbgprop_byte_bin!("Inputs", self.a_in.0),
-                    dbgprop_byte_bin!("Outputs", self.a_out.0),
-                ]
-            ),
-            dbgprop_group!(
-                "Register B",
-                vec![
-                    dbgprop_byte_bin!("DDRB", self.ddrb.0),
-                    dbgprop_byte_bin!("Inputs", self.b_in.0),
-                    dbgprop_byte_bin!("Outputs", self.b_out.0),
-                ]
-            ),
-            dbgprop_group!(
-                "Timer 1",
-                vec![
-                    dbgprop_word!("Counter", self.t1cnt.0),
-                    dbgprop_word!("Latch", self.t1latch.0),
-                    dbgprop_bool!("Armed", self.t1_enable)
-                ]
-            ),
-            dbgprop_group!(
-                "Timer 2",
-                vec![
-                    dbgprop_word!("Counter", self.t2cnt.0),
-                    dbgprop_word!("Latch", self.t2latch.0),
-                    dbgprop_bool!("Armed", self.t2_enable)
-                ]
-            ),
-            dbgprop_udec!("One second timer", self.onesec),
-            dbgprop_byte_bin!("Interrupt Enable (IER)", self.ier.0),
-            dbgprop_byte_bin!("Interrupt Flags (IFR)", self.ifr.0),
-            dbgprop_byte_bin!("Peripheral Control (PCR)", self.pcr.0),
-            dbgprop_byte_bin!("Auxiliary Control (ACR)", self.acr.0),
-        ]
+        let mut props = self.core.debug_properties_ports();
+        props.extend(self.core.debug_properties_control());
+        props
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mac::via_common::{IRQ_CA1, IRQ_CA2};
+
+    /// Register A with handshake
+    const ADDR_A_HS: Address = 0x01 << 9;
+    /// Register A without handshake (vBufA)
+    const ADDR_A: Address = 0x0F << 9;
+    const ADDR_PCR: Address = 0x0C << 9;
+
+    #[test]
+    fn reg_a_no_handshake_keeps_irq_flags() {
+        let mut via = Via::new(16_000_000);
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A);
+        assert!(via.ifr().vblank() && via.ifr().onesec());
+        via.write(ADDR_A, 0);
+        assert!(via.ifr().vblank() && via.ifr().onesec());
+    }
+
+    #[test]
+    fn reg_a_handshake_clears_irq_flags() {
+        let mut via = Via::new(16_000_000);
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().vblank() && !via.ifr().onesec());
+
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.write(ADDR_A_HS, 0);
+        assert!(!via.ifr().vblank() && !via.ifr().onesec());
+    }
+
+    #[test]
+    fn independent_ca2_keeps_irq_flag() {
+        let mut via = Via::new(16_000_000);
+
+        // CA2 independent interrupt input, negative edge
+        via.write(ADDR_PCR, 0x02);
+        via.set_irq(IRQ_CA1);
+        via.set_irq(IRQ_CA2);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().vblank() && via.ifr().onesec());
+
+        // Positive edge
+        via.write(ADDR_PCR, 0x06);
+        via.write(ADDR_A_HS, 0);
+        assert!(via.ifr().onesec());
+
+        // Handshake output is not independent
+        via.write(ADDR_PCR, 0x0A);
+        via.read(ADDR_A_HS);
+        assert!(!via.ifr().onesec());
     }
 }

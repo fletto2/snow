@@ -6,8 +6,9 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+use crate::bus::Address;
+use crate::bus::access::Bus68000;
 use crate::bus::testbus::{Access, Testbus};
-use crate::bus::{Address, Bus, BusResult};
 use crate::cpu_m68k::regs::{RegisterFile, RegisterSR};
 use crate::cpu_m68k::{CpuM68000, M68000_ADDRESS_MASK, M68000_SR_MASK};
 use crate::tickable::Ticks;
@@ -178,7 +179,7 @@ fn print_reg_diff(initial: &RegisterFile, fin: &RegisterFile, actual: &RegisterF
     eprintln!();
 }
 
-fn print_result(cpu: &CpuM68000<Testbus<Address, u8>>, testcase: &Testcase) {
+fn print_result(cpu: &CpuM68000<Testbus<Address, u8, Bus68000>>, testcase: &Testcase) {
     eprintln!(
         "Cycles expected: {} actual: {}",
         testcase.length, cpu.cycles
@@ -288,7 +289,7 @@ fn run_testcase(testcase: &Testcase, level: TestLevel) {
 
     let mut bus = Testbus::new(M68000_ADDRESS_MASK);
     for (addr, val) in &testcase.initial.ram {
-        assert_eq!(bus.write(*addr, *val), BusResult::Ok(*val));
+        bus.write(*addr, *val);
     }
 
     let mut cpu = CpuM68000::new(bus);

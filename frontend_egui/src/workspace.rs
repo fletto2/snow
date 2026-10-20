@@ -14,6 +14,7 @@ use snow_core::mac::MacModel;
 #[cfg(feature = "ethernet")]
 use snow_core::mac::scsi::ethernet::EthernetLinkType;
 use snow_core::mac::scsi::target::ScsiTargetType;
+use snow_core::mac::serial_bridge::SerialBridgeConfig;
 
 /// Custom deserializer that skips invalid shader configs instead of failing entirely
 fn deserialize_shader_configs_lenient<'de, D>(
@@ -51,6 +52,9 @@ pub enum WorkspaceScsiTarget {
     None,
     Disk(RelativePath),
     Cdrom,
+    /// Folder-backed ("Toolbox managed") CD-ROM: the guest swaps between the
+    /// images in this folder via the BlueSCSI Toolbox CD commands.
+    CdromFolder(RelativePath),
     // Do not feature gate Ethernet here to avoid problems with loading
     // workspaces on builds without the ethernet feature
     Ethernet,
@@ -65,7 +69,10 @@ impl TryFrom<ScsiTarget> for WorkspaceScsiTarget {
             ScsiTargetType::Disk => {
                 Self::Disk(RelativePath::from_absolute(&value.image_path.ok_or(())?))
             }
-            ScsiTargetType::Cdrom => Self::Cdrom,
+            ScsiTargetType::Cdrom => match value.cdrom_folder {
+                Some(dir) => Self::CdromFolder(RelativePath::from_absolute(&dir)),
+                None => Self::Cdrom,
+            },
             #[cfg(feature = "ethernet")]
             ScsiTargetType::Ethernet => Self::Ethernet,
             #[cfg(feature = "printer")]
@@ -93,34 +100,46 @@ impl Into<ScsiTarget> for WorkspaceScsiTarget {
             Self::None => ScsiTarget {
                 target_type: None,
                 image_path: None,
+                cdrom_folder: None,
             },
             Self::Cdrom => ScsiTarget {
                 target_type: Some(ScsiTargetType::Cdrom),
                 image_path: None,
+                cdrom_folder: None,
+            },
+            Self::CdromFolder(p) => ScsiTarget {
+                target_type: Some(ScsiTargetType::Cdrom),
+                image_path: None,
+                cdrom_folder: Some(p.get_absolute()),
             },
             Self::Disk(p) => ScsiTarget {
                 target_type: Some(ScsiTargetType::Disk),
                 image_path: Some(p.get_absolute()),
+                cdrom_folder: None,
             },
             #[cfg(feature = "ethernet")]
             Self::Ethernet => ScsiTarget {
                 target_type: Some(ScsiTargetType::Ethernet),
                 image_path: None,
+                cdrom_folder: None,
             },
             #[cfg(not(feature = "ethernet"))]
             Self::Ethernet => ScsiTarget {
                 target_type: None,
                 image_path: None,
+                cdrom_folder: None,
             },
             #[cfg(feature = "printer")]
             Self::Printer => ScsiTarget {
                 target_type: Some(ScsiTargetType::Printer),
                 image_path: None,
+                cdrom_folder: None,
             },
             #[cfg(not(feature = "printer"))]
             Self::Printer => ScsiTarget {
                 target_type: None,
                 image_path: None,
+                cdrom_folder: None,
             },
         }
     }
@@ -284,6 +303,9 @@ pub struct Workspace {
 
     /// Ethernet link type
     pub ethernet_link_type: WorkspaceEthernetLinkType,
+
+    /// Serial bridges per SCC channel (index 0 = Channel A, index 1 = Channel B)
+    pub serial_bridges: [Option<SerialBridgeConfig>; 2],
 }
 
 impl Default for Workspace {
@@ -320,6 +342,7 @@ impl Default for Workspace {
             shader_enabled: false,
             shader_configs: Vec::new(),
             ethernet_link_type: WorkspaceEthernetLinkType::default(),
+            serial_bridges: [None, None],
         }
     }
 }
@@ -344,7 +367,17 @@ impl Workspace {
         let reader = BufReader::new(file);
 
         let mut result: Self = serde_json::from_reader(reader)?;
+
         let parent = path.parent().context("Cannot resolve parent path")?;
+        // Default to the current working directory if the input path has no parent. It could be
+        // relative to the current directory and provided as only the filename, in which case
+        // parent() returns an empty string.
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
         if let Some(p) = result.rom_path.as_mut() {
             p.after_deserialize(parent)?;
         }
@@ -362,7 +395,9 @@ impl Workspace {
         }
         for d in &mut result.scsi_targets {
             match d {
-                WorkspaceScsiTarget::Disk(p) => p.after_deserialize(parent)?,
+                WorkspaceScsiTarget::Disk(p) | WorkspaceScsiTarget::CdromFolder(p) => {
+                    p.after_deserialize(parent)?;
+                }
                 WorkspaceScsiTarget::None
                 | WorkspaceScsiTarget::Cdrom
                 | WorkspaceScsiTarget::Ethernet
@@ -398,6 +433,15 @@ impl Workspace {
     pub fn write_file(&mut self, path: &Path) -> Result<()> {
         // Resolve relative paths
         let parent = path.parent().context("Cannot resolve parent path")?;
+        // Default to the current working directory if the input path has no parent. It could be
+        // relative to the current directory and provided as only the filename, in which case
+        // parent() returns an empty string.
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
         if let Some(p) = self.rom_path.as_mut() {
             p.before_serialize(parent)?;
         }
@@ -416,7 +460,9 @@ impl Workspace {
         // disks is deprecated
         for d in &mut self.scsi_targets {
             match d {
-                WorkspaceScsiTarget::Disk(p) => p.before_serialize(parent)?,
+                WorkspaceScsiTarget::Disk(p) | WorkspaceScsiTarget::CdromFolder(p) => {
+                    p.before_serialize(parent)?;
+                }
                 WorkspaceScsiTarget::None
                 | WorkspaceScsiTarget::Cdrom
                 | WorkspaceScsiTarget::Ethernet

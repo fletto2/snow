@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::bus::{Address, Bus, IrqSource};
 use crate::cpu_m68k::fpu::regs::FpuRegisterFile;
 use crate::cpu_m68k::pmmu::regs::PmmuRegisterFile;
+use crate::cpu_m68k::pmmu::translate::atc_generation_default;
 use crate::cpu_m68k::regs::RegisterCACR;
 use crate::cpu_m68k::{M68000_SR_MASK, M68020_CACR_MASK, M68030, M68030_CACR_MASK};
 use crate::tickable::{Tickable, Ticks};
@@ -364,6 +365,11 @@ pub struct CpuM68k<
     pub(in crate::cpu_m68k) pmmu_atc: [Vec<Option<crate::cpu_m68k::pmmu::translate::PmmuAtcEntry>>;
         crate::cpu_m68k::pmmu::translate::PMMU_ATCS],
 
+    /// Current ATC generation. Entries tagged with an older generation have been flushed
+    /// On flush, this is incremented to efficiently invalidate the entire ATC.
+    #[serde(default = "crate::cpu_m68k::pmmu::translate::atc_generation_default")]
+    pub(in crate::cpu_m68k) pmmu_atc_generation: u32,
+
     /// 68020+ I-cache lines
     #[serde(with = "BigArray")]
     icache_lines: [[u8; ICACHE_LINE_SIZE]; ICACHE_LINES],
@@ -528,6 +534,7 @@ where
             systrap_history: VecDeque::with_capacity(Self::HISTORY_SIZE),
             systrap_history_enabled: false,
             pmmu_atc: Default::default(),
+            pmmu_atc_generation: atc_generation_default(),
             icache_lines: core::array::from_fn(|_| Default::default()),
             icache_tags: [ICACHE_TAG_INVALID; ICACHE_LINES],
             restart_regs: None,
@@ -4338,33 +4345,25 @@ where
 
         self.prefetch_pump()?;
 
-        let (quotient, remainder) = match (extword.signed(), extword.size()) {
-            (false, false) => {
-                // 32-bit unsigned
-                (dividend / divisor, dividend % divisor)
+        let (quotient, remainder, overflow) = if extword.signed() {
+            let a = if extword.size() {
+                dividend as i64
+            } else {
+                i64::from(dividend as u32 as i32)
+            };
+            let b = i64::from(divisor as u32 as i32);
+            // None for i64::MIN / -1, which overflows too
+            match a.checked_div(b) {
+                Some(q) => (q as u64, (a % b) as u64, i32::try_from(q).is_err()),
+                None => (0, 0, true),
             }
-            (true, false) => {
-                // 32-bit signed
-                (
-                    ((dividend as u32 as i32) / (divisor as u32 as i32)) as i64 as u64,
-                    ((dividend as u32 as i32) % (divisor as u32 as i32)) as i64 as u64,
-                )
-            }
-            (false, true) => {
-                // 64-bit unsigned
-                (dividend / divisor, dividend % divisor)
-            }
-            (true, true) => {
-                // 64-bit signed
-                (
-                    ((dividend as i64) / (divisor as i64)) as u64,
-                    ((dividend as i64) % (divisor as i64)) as u64,
-                )
-            }
+        } else {
+            let q = dividend / divisor;
+            (q, dividend % divisor, q > u64::from(u32::MAX))
         };
 
-        // Check overflow conditions on 64-bit divisions if the result exceeds 32-bit
-        if extword.size() && ![u32::MIN, u32::MAX].contains(&((quotient >> 32) as u32)) {
+        // The quotient must fit in 32 bits; the operands are left unchanged
+        if overflow {
             debug!("DIV.l overflow");
             self.regs.sr.set_v(true);
             return Ok(());
@@ -4497,6 +4496,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::bus::access::{Bus68000, Bus68020};
     use crate::bus::testbus::Testbus;
     use crate::cpu_m68k::{CpuM68000, CpuM68020Fpu, M68000_ADDRESS_MASK, M68020_ADDRESS_MASK};
 
@@ -4504,15 +4504,17 @@ mod tests {
 
     #[test]
     fn sr_68000() {
-        let mut cpu = CpuM68000::<Testbus<Address, Byte>>::new(Testbus::new(M68000_ADDRESS_MASK));
+        let mut cpu =
+            CpuM68000::<Testbus<Address, Byte, Bus68000>>::new(Testbus::new(M68000_ADDRESS_MASK));
         cpu.set_sr(0xFFFF);
         assert!(!cpu.regs.sr.m());
     }
 
     #[test]
     fn sr_68020() {
-        let mut cpu =
-            CpuM68020Fpu::<Testbus<Address, Byte>>::new(Testbus::new(M68020_ADDRESS_MASK));
+        let mut cpu = CpuM68020Fpu::<Testbus<Address, Byte, Bus68020>>::new(Testbus::new(
+            M68020_ADDRESS_MASK,
+        ));
         cpu.set_sr(0xFFFF);
         assert!(cpu.regs.sr.m());
     }

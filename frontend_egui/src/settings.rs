@@ -1,6 +1,7 @@
 use anyhow::Result;
 use egui_file_dialog::FileDialogStorage;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use snow_core::mac::{MacModel, NubusDeviceKind};
 use std::path::{Path, PathBuf};
 use strum::{Display, EnumIter};
@@ -29,8 +30,34 @@ pub enum CmdKeyMapping {
     RightCtrl,
 }
 
+/// Custom deserializer that skips entries that cannot be parsed (e.g. a model
+/// or card unknown to this version) instead of failing entirely
+fn deserialize_vec_lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let values: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    let mut out = Vec::new();
+
+    for value in values {
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                log::warn!("Skipping invalid settings entry {}: {}", value, e);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 const MAX_RECENT_WORKSPACES: usize = 10;
 const MAX_RECENT_IMAGES: usize = 10;
+
+fn bool_true() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
@@ -38,15 +65,18 @@ pub struct AppSettings {
     pub recent_workspaces: Vec<PathBuf>,
     pub recent_floppy_images: Vec<PathBuf>,
     pub recent_cd_images: Vec<PathBuf>,
+    #[serde(deserialize_with = "deserialize_vec_lenient")]
     pub last_roms: Vec<(MacModel, PathBuf)>,
     // Deprecated; now roms_by_card
     #[serde(skip_serializing)]
     pub last_display_roms: Vec<(MacModel, PathBuf)>,
+    #[serde(deserialize_with = "deserialize_vec_lenient")]
     pub roms_by_card: Vec<(NubusDeviceKind, PathBuf)>,
 
     pub fd_hdd: FileDialogStorage,
     pub fd_cdrom: FileDialogStorage,
     pub fd_cdrom_files: FileDialogStorage,
+    pub fd_cdrom_folder: FileDialogStorage,
     pub fd_floppy: FileDialogStorage,
     pub fd_record: FileDialogStorage,
     pub fd_workspace: FileDialogStorage,
@@ -58,7 +88,13 @@ pub struct AppSettings {
     pub fastforward_limit_enabled: bool,
     pub fastforward_limit: f64,
     pub dynamic_fastforward: bool,
+    #[serde(default = "bool_true")]
     pub auto_relative_mouse_fullscreen: bool,
+    /// Multiplier applied to mouse motion in relative mouse mode
+    pub relative_mouse_speed: f32,
+    /// Capture the mouse in relative mouse mode
+    #[serde(default = "bool_true")]
+    pub mouse_capture: bool,
     pub writeback_mode: PromptChoice,
     pub convert_to_moof_mode: PromptChoice,
     /// When true, copy the loaded image to a timestamped sibling file
@@ -66,6 +102,9 @@ pub struct AppSettings {
     pub backup_on_writeback: bool,
     /// How the right modifier key maps to the Mac's Cmd key
     pub cmd_key_mapping: CmdKeyMapping,
+    /// If true, resumes execution when the emulator is reset, even when paused
+    #[serde(default = "bool_true")]
+    pub run_on_reset: bool,
 }
 
 impl Default for AppSettings {
@@ -80,6 +119,7 @@ impl Default for AppSettings {
             fd_hdd: Default::default(),
             fd_cdrom: Default::default(),
             fd_cdrom_files: Default::default(),
+            fd_cdrom_folder: Default::default(),
             fd_floppy: Default::default(),
             fd_record: Default::default(),
             fd_workspace: Default::default(),
@@ -91,10 +131,13 @@ impl Default for AppSettings {
             fastforward_limit: 2.0,
             dynamic_fastforward: false,
             auto_relative_mouse_fullscreen: true,
+            relative_mouse_speed: 1.0,
+            mouse_capture: true,
             writeback_mode: PromptChoice::default(),
             convert_to_moof_mode: PromptChoice::default(),
             backup_on_writeback: false,
             cmd_key_mapping: CmdKeyMapping::default(),
+            run_on_reset: true,
         }
     }
 }
@@ -116,8 +159,14 @@ impl AppSettings {
             && let Ok(file) = std::fs::File::open(path)
             && let Ok(settings) = serde_json::from_reader(std::io::BufReader::new(file))
         {
+            log::info!(
+                "Loaded settings from {}",
+                Self::config_path().unwrap().display()
+            );
             return settings;
         }
+
+        log::warn!("Could not parse settings file, using defaults");
         Default::default()
     }
 
@@ -265,5 +314,32 @@ impl AppSettings {
                 (i + 1, path.clone(), display_name)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_models_and_cards_are_skipped() {
+        let json = r#"{
+            "last_roms": [["Plus", "/a.rom"], ["FutureMac", "/b.rom"], ["SE30", "/c.rom"]],
+            "roms_by_card": [["Toby", "/d.rom"], ["FutureCard", "/e.rom"]],
+            "hide_mode_toasts": true
+        }"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.last_roms,
+            vec![
+                (MacModel::Plus, PathBuf::from("/a.rom")),
+                (MacModel::SE30, PathBuf::from("/c.rom"))
+            ]
+        );
+        assert_eq!(
+            settings.roms_by_card,
+            vec![(NubusDeviceKind::Toby, PathBuf::from("/d.rom"))]
+        );
+        assert!(settings.hide_mode_toasts);
     }
 }

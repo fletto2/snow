@@ -8,12 +8,13 @@
 //! Ported with permission from tests written by Howard Price
 
 use crate::bus::Address;
+use crate::bus::access::Bus68020;
 use crate::bus::testbus::Testbus;
 use crate::cpu_m68k::cpu::PrefetchWord;
 use crate::cpu_m68k::{CpuM68020Fpu, M68020_ADDRESS_MASK};
 use crate::types::{Long, Word};
 
-type TestCpu = CpuM68020Fpu<Testbus<Address, u8>>;
+type TestCpu = CpuM68020Fpu<Testbus<Address, u8, Bus68020>>;
 
 /// Initialize a test system with code at a given PC
 fn testcpu(initial_ssp: Address, initial_pc: Address, code: &[u16]) -> TestCpu {
@@ -231,10 +232,12 @@ fn test_privilege_violation_exception_68020(code: &[u16], test_name: &str, expec
         test_name
     );
 
+    // MC68020 UM (1984) 9.2.17: privilege violation, worst case (no cache)
+    // 27 (1/2/4)
     let length_cycles = cpu.cycles - cycles_start;
     assert_eq!(
-        length_cycles, 34,
-        "{}: Expect privilege violation to take 34 clocks",
+        length_cycles, 27,
+        "{}: Expect privilege violation to take 27 clocks",
         test_name
     );
 

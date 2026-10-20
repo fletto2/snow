@@ -3,8 +3,10 @@ use std::fmt::Display;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::NubusSlot;
 use crate::bus::{Address, BusMember};
 use crate::debuggable::Debuggable;
+use crate::emulator::EmuContext;
 use crate::renderer::{DisplayBuffer, Renderer};
 use crate::tickable::{Tickable, Ticks};
 use crate::types::LatchingEvent;
@@ -54,16 +56,6 @@ where
         }
     }
 
-    pub fn reset(&mut self) {
-        self.vblank_irq = false;
-        self.vblank_enable = false;
-        self.fb_select = false;
-    }
-
-    pub fn get_irq(&self) -> bool {
-        self.vblank_irq
-    }
-
     pub fn framebuffer(&self) -> &[u8] {
         let base_offset = if !self.fb_select { 0 } else { 0x8000 };
 
@@ -91,20 +83,39 @@ where
             buf[idx * 4 + 3] = 0xFF;
         }
     }
+}
 
-    pub fn blank(&mut self) -> Result<()> {
+impl<TRenderer> NubusSlot<TRenderer> for SE30Video<TRenderer>
+where
+    TRenderer: Renderer,
+{
+    fn reset(&mut self) {
+        self.vblank_irq = false;
+        self.vblank_enable = false;
+        self.fb_select = false;
+    }
+
+    fn get_irq(&self) -> bool {
+        self.vblank_irq
+    }
+
+    fn blank(&mut self) -> Result<()> {
         self.vram.fill(0xFF);
         self.render()?;
         Ok(())
     }
 
-    pub fn render(&mut self) -> Result<()> {
+    fn render(&mut self) -> Result<()> {
         // We have to move the renderer so we don't upset the borrow checker.
         let mut renderer = self.renderer.take().unwrap();
         self.render_to(renderer.buffer_mut());
         self.renderer = Some(renderer);
         self.renderer.as_mut().unwrap().update()?;
         Ok(())
+    }
+
+    fn set_renderer(&mut self, renderer: TRenderer) {
+        self.renderer = Some(renderer);
     }
 }
 
@@ -136,19 +147,21 @@ where
     }
 }
 
-impl<TRenderer> Tickable for SE30Video<TRenderer>
+impl<TRenderer> Tickable<&dyn EmuContext> for SE30Video<TRenderer>
 where
     TRenderer: Renderer,
 {
-    fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
+    fn tick(&mut self, ticks: Ticks, ctx: &dyn EmuContext) -> Result<Ticks> {
         self.vblank_ticks += ticks;
         if !self.vblank_enable {
             self.vblank_irq = false;
         }
-        if self.vblank_ticks >= 16_000_000 / 60 {
-            self.render()?;
+        if self.vblank_ticks >= ctx.bus_frequency() / 60 {
+            if self.renderer.as_ref().unwrap().frame_wanted() {
+                self.render()?;
+            }
 
-            self.vblank_ticks -= 16_000_000 / 60;
+            self.vblank_ticks -= ctx.bus_frequency() / 60;
             if self.vblank_enable {
                 self.vblank_irq = true;
             }

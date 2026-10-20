@@ -82,24 +82,40 @@ bitfield! {
     }
 }
 
+/// CPU cycles per cycle of the power manager's internal clock: its
+/// 3.93216 MHz crystal divided by 2
+const PM_CLOCK: usize = 8;
+/// Time the host has for each step of a byte it sends: the firmware polls
+/// /PMREQ 9 times ($E9CC), after the code between two bytes
+const RX_TIMEOUT: usize = 70 * PM_CLOCK;
+/// Time from a byte of a reply to the next one, by which the host must have
+/// released /PMREQ: the firmware checks it once ($EA38). About the same
+/// time to get back to the main loop after the last one.
+const TX_GAP: usize = 28 * PM_CLOCK;
+/// Time the host has to take a byte of a reply: 256 rounds of the polling
+/// loop at $EA47
+const TX_TIMEOUT: usize = 256 * 15 * PM_CLOCK;
+/// Time from the last byte of a command to the first byte of its reply:
+/// the firmware's dispatch from its main loop ($E920) and the start of the
+/// reply ($EA10), not counting the command itself
+const COMMAND_TIME: usize = 110 * PM_CLOCK;
+
+/// Handshake with the host, a byte at a time on /PMREQ and /PMACK, as the
+/// firmware does it
 #[derive(Debug, Serialize, Deserialize)]
 enum State {
+    /// Waiting for the host to start a command
     Idle,
-    GetCommand,
-    WaitLength,
-    GetLength,
-    WaitData,
-    GetData,
-    WaitCommand,
-    DoCommand,
-    ReturnCmd,
-    ReturnCmdWait,
-    ReturnLength,
-    ReturnDataWait,
-    ReturnData,
-    Cleanup,
-    CleanupWait,
-    Cleanup2,
+    /// Receiving: waiting for /PMREQ low with the next byte
+    RxWait,
+    /// Byte taken, /PMACK low: waiting for /PMREQ high
+    RxAck,
+    /// Running the command
+    Command,
+    /// Sending: waiting to present the next byte
+    TxWait,
+    /// Byte presented, /PMACK low: waiting for /PMREQ low
+    TxAck,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,15 +170,24 @@ pub struct Pmgr {
     length: Byte,
     data_pointer: usize,
     data: Vec<Byte>,
-    wait_count: usize,
+    /// CPU cycles left in the current handshake step
+    timer: usize,
 
     pub(crate) pmreq: bool,
     pub(crate) pmack: bool,
     pub(crate) a_in: Byte,
     pub(crate) a_out: Byte,
-    pub(crate) interrupt: bool,
-    pub(crate) onesec: bool,
-    onesec_latch: bool,
+
+    /// Pending pulse on the interrupt line (/PMINT)
+    pmint: bool,
+    /// Pending pulse on the one second line
+    onesec: bool,
+    /// Pending 60 Hz tick, handled when idle
+    tick_pending: bool,
+    /// Amount of 60 Hz ticks in the current second
+    tick_count: u8,
+    /// An ADB command from the host has completed
+    adb_done: bool,
 
     adb_data_length: Byte,
     adb_data: Vec<Byte>,
@@ -213,16 +238,18 @@ impl Pmgr {
             length: 0x00,
             data_pointer: 0x00,
             data: vec![0; 20],
-            wait_count: 0,
+            timer: 0,
 
             pmreq: true,
             pmack: true,
             a_in: 0x00,
             a_out: 0x00,
-            onesec: false,
-            onesec_latch: false,
 
-            interrupt: false,
+            pmint: false,
+            onesec: false,
+            tick_pending: false,
+            tick_count: 0,
+            adb_done: false,
 
             adb_data_length: 0x00,
             adb_data: vec![0; 2],
@@ -365,8 +392,14 @@ impl Pmgr {
     }
 
     /// Turn ADB off
+    ///
+    /// Stops the polling of ADB devices until the host initializes ADB again.
     fn adb_off(&mut self) -> (Result<()>, Option<Vec<Byte>>) {
         self.interrupt_flags.set_adbint(false);
+        self.adb_status.0 = 0;
+        self.adb_ready = false;
+        self.srq_waiting = false;
+        self.adb_done = false;
         (Ok(()), None)
     }
 
@@ -768,7 +801,171 @@ impl Pmgr {
         self.adb_ready = false;
         self.adb_status.set_srq(false);
         self.interrupt_flags.set_adbint(false);
-        self.interrupt = false;
+        self.pmint = false;
+        self.adb_done = false;
+    }
+
+    /// Signals the 60 Hz tick
+    pub(crate) fn tick_60hz(&mut self) {
+        self.tick_pending = true;
+    }
+
+    /// Returns whether to pulse the interrupt line (/PMINT)
+    pub(crate) fn take_pmint(&mut self) -> bool {
+        std::mem::take(&mut self.pmint)
+    }
+
+    /// Returns whether to pulse the one second line
+    pub(crate) fn take_onesec(&mut self) -> bool {
+        std::mem::take(&mut self.onesec)
+    }
+
+    /// Tests whether an interrupt is pending. The reset flag is reported
+    /// to the host but does not cause an interrupt.
+    fn interrupt_pending(&self) -> bool {
+        self.interrupt_flags.0 & 0b111 != 0
+    }
+
+    /// Pulses the interrupt line if an interrupt is pending.
+    ///
+    /// The Power Manager only does this when idle and repeats it on every
+    /// 60 Hz tick for as long as the interrupt remains pending.
+    fn check_irq(&mut self) {
+        if self.interrupt_pending() {
+            self.pmint = true;
+        }
+    }
+
+    /// Handles a 60 Hz tick
+    fn do_tick_60hz(&mut self) {
+        self.tick_count += 1;
+        if self.tick_count >= 60 {
+            self.tick_count = 0;
+            self.time = self.time.wrapping_add(1);
+            self.onesec = true;
+            self.rtc.second();
+        }
+
+        // Check if any devices have asserted SRQ, once the host has
+        // initialized ADB
+        if self.adb_ready
+            && self.adb_devices.iter().any(|d| d.get_srq())
+            && !self.interrupt_flags.adbint()
+        {
+            self.adb_srq();
+        }
+
+        self.check_irq();
+    }
+}
+
+impl Pmgr {
+    /// Byte `n` of the command or of its reply
+    fn byte(&self, n: usize) -> Byte {
+        match n {
+            0 => self.cmd,
+            1 => self.length,
+            _ => self.data[n - 2],
+        }
+    }
+
+    /// Gives up on a command when the host doesn't keep up
+    fn abort(&mut self) {
+        warn!(
+            "Handshake timeout in {:?}, command {:02X}",
+            self.state, self.cmd
+        );
+        self.pmack = true;
+        self.a_in = 0xFF;
+        self.state = State::Idle;
+    }
+
+    /// Runs the handshake for one CPU cycle
+    fn handshake(&mut self) {
+        self.timer = self.timer.saturating_sub(1);
+        match self.state {
+            State::Idle => {
+                if !self.pmreq {
+                    // The data bus is released while receiving
+                    self.a_in = 0xFF;
+                    self.data = vec![0; 20];
+                    self.data_pointer = 0;
+                    self.state = State::RxWait;
+                }
+            }
+            State::RxWait => {
+                if !self.pmreq {
+                    let val = self.a_out;
+                    match self.data_pointer {
+                        0 => {
+                            self.cmd = val;
+                            self.read = val & 0x08 != 0;
+                        }
+                        1 => self.length = val,
+                        n => self.data[n - 2] = val,
+                    }
+                    self.data_pointer += 1;
+                    self.pmack = false;
+                    self.timer = RX_TIMEOUT;
+                    self.state = State::RxAck;
+                } else if self.timer == 0 {
+                    self.abort();
+                }
+            }
+            State::RxAck => {
+                if self.pmreq {
+                    self.pmack = true;
+                    if self.data_pointer >= 2 + usize::from(self.length) {
+                        self.timer = COMMAND_TIME;
+                        self.state = State::Command;
+                    } else {
+                        self.timer = RX_TIMEOUT;
+                        self.state = State::RxWait;
+                    }
+                } else if self.timer == 0 {
+                    self.abort();
+                }
+            }
+            State::Command => {
+                if self.timer == 0 {
+                    let data = self.data.clone();
+                    self.data = self.cmd(self.cmd, &data).1.unwrap_or_else(|| vec![0; 4]);
+                    self.data_pointer = 0;
+                    self.state = if self.read {
+                        State::TxWait
+                    } else {
+                        State::Idle
+                    };
+                }
+            }
+            State::TxWait => {
+                if self.timer == 0 {
+                    if self.data_pointer >= 2 + usize::from(self.length) {
+                        // Back to the main loop, which releases the data bus
+                        self.a_in = 0xFF;
+                        self.state = State::Idle;
+                    } else if self.pmreq {
+                        self.a_in = self.byte(self.data_pointer);
+                        self.pmack = false;
+                        self.timer = TX_TIMEOUT;
+                        self.state = State::TxAck;
+                    } else {
+                        self.abort();
+                    }
+                }
+            }
+            State::TxAck => {
+                if !self.pmreq {
+                    // The host reads the byte before it sees /PMACK high
+                    self.pmack = true;
+                    self.data_pointer += 1;
+                    self.timer = TX_GAP;
+                    self.state = State::TxWait;
+                } else if self.timer == 0 {
+                    self.abort();
+                }
+            }
+        }
     }
 }
 
@@ -776,218 +973,23 @@ impl Tickable for Pmgr {
     fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
         // TODO support batching ticks
         for _ in 0..ticks {
-            // Handle the one-second signal to the VIA
-            if self.onesec & !self.onesec_latch {
-                self.time += 1;
-                self.onesec_latch = true;
-            } else if !self.onesec & self.onesec_latch {
-                self.onesec_latch = false;
-            }
-
-            // Check for interrupts
-            self.interrupt = (self.interrupt_flags.0 != 0) & self.adb_ready;
-
             // Check if we're waiting to process an ADB command
             if self.adb_status.new() {
                 self.adb_cmd_do();
+                self.adb_done = true;
             }
 
-            // Check if any devices have asserted SRQ
-            if self.adb_devices.iter().any(|d| d.get_srq()) & !self.interrupt_flags.adbint() {
-                self.adb_srq();
-            }
-
-            // Power Manager communication state machine
-            match self.state {
-                // Idle: Wait for the host to start a handshake
-                State::Idle => {
-                    if !self.pmreq {
-                        self.state = State::GetCommand;
-                    }
+            // The tick and the interrupt are only handled when idle
+            if matches!(self.state, State::Idle) && self.pmreq {
+                if std::mem::take(&mut self.tick_pending) {
+                    self.do_tick_60hz();
                 }
-
-                // GetCommand: Receive a command byte from the host
-                State::GetCommand => {
-                    if self.pmack {
-                        let cmd = self.a_out;
-                        self.read = cmd & 0x08 == 0x08;
-                        self.cmd = cmd;
-                        self.pmack = false;
-                        if cmd == 0x00 {
-                            self.pmack = true;
-                            self.state = State::Idle;
-                        }
-                    }
-                    if self.pmreq {
-                        self.pmack = true;
-                        self.state = State::WaitLength;
-                    }
-                }
-
-                // WaitLength: Wait for pmreq to be asserted to receive the length of the command
-                State::WaitLength => {
-                    if !self.pmreq {
-                        self.state = State::GetLength;
-                    }
-                }
-
-                // GetLength: Receive the length of the data
-                State::GetLength => {
-                    if self.pmack {
-                        self.length = self.a_out;
-                        self.pmack = false;
-                    }
-                    if self.pmreq {
-                        self.pmack = true;
-                        if self.length == 0 {
-                            self.wait_count = 10;
-                            self.state = State::WaitCommand;
-                        } else {
-                            self.state = State::WaitData;
-                        }
-                    }
-                }
-
-                // WaitData: Wait for pmreq to be asserted to receive the data
-                State::WaitData => {
-                    if !self.pmreq {
-                        self.state = State::GetData;
-                    }
-                }
-
-                // GetData: Receive the data
-                State::GetData => {
-                    if self.pmack {
-                        self.data[self.data_pointer] = self.a_out;
-                        self.pmack = false;
-                    }
-                    if self.pmreq {
-                        self.pmack = true;
-                        self.data_pointer += 1;
-                        if self.data_pointer >= self.length as usize {
-                            self.wait_count = 10;
-                            self.data_pointer = 0;
-                            self.state = State::WaitCommand;
-                        } else {
-                            self.state = State::WaitData;
-                        }
-                    }
-                }
-
-                // WaitCommand: Wait for the host to be ready to handshake in the other direction
-                State::WaitCommand => {
-                    if self.wait_count == 0 {
-                        self.state = State::DoCommand;
-                    } else {
-                        self.wait_count -= 1;
-                    }
-                }
-
-                // DoCommand: Execute the command
-                State::DoCommand => {
-                    let data_copy = self.data.clone();
-                    self.data = self
-                        .cmd(self.cmd, &data_copy)
-                        .1
-                        .unwrap_or_else(|| vec![0; 4]);
-                    if self.read {
-                        self.state = State::ReturnCmd;
-                    } else {
-                        self.state = State::Cleanup;
-                    }
-                }
-
-                // ReturnCmd: Send the command byte back to the host
-                State::ReturnCmd => {
-                    if self.pmreq & self.pmack {
-                        self.pmack = false;
-                        self.a_in = self.cmd;
-                    }
-                    if !self.pmreq {
-                        self.pmack = true;
-                        self.wait_count = 100;
-                        self.state = State::ReturnCmdWait;
-                    }
-                }
-
-                // ReturnCmdWait: Wait for the host to be ready to handshake in the other direction
-                State::ReturnCmdWait => {
-                    if self.wait_count == 0 {
-                        self.state = State::ReturnLength;
-                    } else {
-                        self.wait_count -= 1;
-                    }
-                }
-
-                // ReturnLength: Send the length of the data back to the host
-                State::ReturnLength => {
-                    if self.pmreq & self.pmack {
-                        self.pmack = false;
-                        self.a_in = self.length;
-                    }
-                    if !self.pmreq {
-                        self.pmack = true;
-                        if self.length == 0 {
-                            self.state = State::Cleanup;
-                        } else {
-                            self.wait_count = 100;
-                            self.state = State::ReturnDataWait;
-                        }
-                    }
-                }
-
-                // ReturnDataWait: Wait for the host to be ready to handshake in the other direction
-                State::ReturnDataWait => {
-                    if self.wait_count == 0 {
-                        self.state = State::ReturnData;
-                    } else {
-                        self.wait_count -= 1;
-                    }
-                }
-
-                // ReturnData: Send the data back to the host
-                State::ReturnData => {
-                    if self.pmreq & self.pmack {
-                        self.pmack = false;
-                        self.a_in = self.data[self.data_pointer];
-                    }
-                    if !self.pmreq {
-                        self.pmack = true;
-                        self.data_pointer += 1;
-                        if self.data_pointer >= self.length as usize {
-                            self.state = State::Cleanup;
-                        } else {
-                            self.wait_count = 100;
-                            self.state = State::ReturnDataWait;
-                        }
-                    }
-                }
-
-                // Cleanup: Clear variables for the next run
-                State::Cleanup => {
-                    self.cmd = 0x00;
-                    self.length = 0x00;
-                    self.data_pointer = 0x00;
-                    self.data = vec![0; 20];
-                    self.wait_count = 100;
-                    self.state = State::CleanupWait;
-                }
-
-                // CleanupWait: Wait for the host to finish receiving the last byte
-                State::CleanupWait => {
-                    if self.wait_count == 0 {
-                        self.state = State::Cleanup2;
-                    } else {
-                        self.wait_count -= 1;
-                    }
-                }
-
-                // Cleanup2: Pull the communication bus high and return to idle
-                State::Cleanup2 => {
-                    self.a_in = 0xFF;
-                    self.state = State::Idle;
+                if std::mem::take(&mut self.adb_done) {
+                    self.check_irq();
                 }
             }
+
+            self.handshake();
         }
 
         Ok(ticks)
@@ -1038,7 +1040,7 @@ impl Debuggable for Pmgr {
                     })
                     .collect()
             ),
-            dbgprop_bool!("Power Manager Interrupt", self.interrupt),
+            dbgprop_bool!("Power Manager Interrupt", self.interrupt_pending()),
             dbgprop_bool!("ADB SRQ", self.adb_devices.iter().any(|d| d.get_srq())),
         ]
     }

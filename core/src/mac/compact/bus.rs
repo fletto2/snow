@@ -6,7 +6,8 @@ use super::audio::AudioState;
 use super::dram::DramDecay;
 use super::onerom::OneRom;
 use super::video::Video;
-use crate::bus::{Address, Bus, BusMember, BusResult, InspectableBus, IrqSource};
+use crate::bus::access::{Bus68000, BusAccess, BusResponse, bus_access_byte_lane, bus_access_word};
+use crate::bus::{Address, Bus, BusMember, InspectableBus, IrqSource};
 use crate::debuggable::Debuggable;
 use crate::emulator::comm::EmulatorSpeed;
 use crate::emulator::{EmuContext, MouseMode};
@@ -19,6 +20,7 @@ use crate::mac::scsi::controller::ScsiController;
 use crate::mac::swim::Swim;
 use crate::mac::swim::drive::DriveType;
 use crate::mac::via::Via;
+use crate::mac::via_common::{LineState, ViaLine};
 use crate::renderer::{
     AUDIO_BUFFER_SAMPLES, AUDIO_CHANNELS, AudioProvider, Renderer, null_audio_sink,
 };
@@ -32,8 +34,38 @@ use log::*;
 use num_traits::{FromPrimitive, PrimInt, ToBytes};
 use serde::{Deserialize, Serialize};
 
+/// Frequency of the bus of the real hardware, without overclocking: the
+/// CPU clock, C8M (7.8336 MHz), which a bus cycle is counted in
+const BUS_FREQUENCY: Ticks = 7_833_600;
+
 /// Size of a RAM page in MacBus::ram_dirty
 pub const RAM_DIRTY_PAGESIZE: usize = 256;
+
+/// Size of the blocks of the address map
+const MAP_BLOCK_SHIFT: u32 = 17;
+const MAP_BLOCKS: usize = 1 << (24 - MAP_BLOCK_SHIFT);
+
+/// What answers in a block of the address map
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Region {
+    None,
+    Ram,
+    /// RAM while the boot overlay is on
+    RamOverlay,
+    Rom,
+    /// Reads the open bus
+    OpenBus,
+    Scsi,
+    Scc,
+    Iwm,
+    Via,
+    PhaseRead,
+    /// Test software region / extension ROM
+    ExtRom,
+}
+
+/// Address map: the region of each block, with the boot overlay off and on
+type AddressMap = [[Region; MAP_BLOCKS]; 2];
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -71,6 +103,10 @@ pub struct CompactMacBus<TRenderer: Renderer> {
     pub(crate) audio: AudioState,
 
     eclock: Ticks,
+    /// The VPA cycle in progress has waited once, as it always does. Not
+    /// saved, as a cycle is never in progress between instructions.
+    #[serde(skip)]
+    vpa_polled: bool,
     mouse_ready: bool,
     pub(crate) swim: Swim,
     pub(crate) scsi: ScsiController,
@@ -94,8 +130,14 @@ pub struct CompactMacBus<TRenderer: Renderer> {
 
     overlay: bool,
 
+    #[serde(skip, default = "empty_map")]
+    map: AddressMap,
+
     /// Emulation speed setting
     pub(crate) speed: EmulatorSpeed,
+
+    /// Frequency of the bus, which includes any overclocking
+    act_bus_frequency: Ticks,
 
     /// Last pushed audio sample
     last_audiosample: u8,
@@ -105,9 +147,6 @@ pub struct CompactMacBus<TRenderer: Renderer> {
     /// sleep for in Video speed mode.
     #[serde(skip, default = "Instant::now")]
     vblank_time: Instant,
-
-    /// VPA/E-clock sync in progress
-    vpa_sync: bool,
 
     /// Programmer's key pressed
     progkey_pressed: LatchingEvent,
@@ -190,12 +229,13 @@ where
                 .map(|i| if i % 2 == 0 { 0x55u8 } else { 0xAAu8 })
                 .collect(),
             ram_dirty: BitSet::from_iter(0..(ram_size / RAM_DIRTY_PAGESIZE)),
-            via: Via::new(model),
+            via: Via::new(model, BUS_FREQUENCY),
             video: Video::new(renderer),
             audio: AudioState::default(),
             eclock: 0,
+            vpa_polled: false,
             scc: Scc::new(),
-            swim: Swim::new(&fdds, model.fdd_hd(), 8_000_000),
+            swim: Swim::new(&fdds, model.fdd_hd(), BUS_FREQUENCY),
             scsi: ScsiController::new(),
             mouse_ready: false,
 
@@ -213,10 +253,11 @@ where
             soundbuf_alt: sound_alt_start..(sound_alt_start + Self::SOUNDBUF_SIZE),
 
             overlay: true,
+            map: build_map(model),
             speed: EmulatorSpeed::Accurate,
+            act_bus_frequency: BUS_FREQUENCY,
             last_audiosample: 0,
             vblank_time: Instant::now(),
-            vpa_sync: false,
             progkey_pressed: LatchingEvent::default(),
             mouse_mode,
             plusmouse_rel_x: 0,
@@ -241,6 +282,7 @@ where
 
     /// Reinstalls things that can't be serialized and does some updates upon deserialization
     pub fn after_deserialize(&mut self, renderer: TRenderer) {
+        self.map = build_map(self.model);
         self.video.renderer = Some(renderer);
         // Make sure we have at least the last frame available
         self.video.render().unwrap();
@@ -271,7 +313,7 @@ where
     }
 
     fn soundbuf(&mut self) -> &mut [u8] {
-        if self.model >= MacModel::SE || self.via.a_out.sndpg2() {
+        if self.model >= MacModel::SE || self.via.pa().sndpg2() {
             &mut self.ram[self.soundbuf_main.clone()]
         } else {
             &mut self.ram[self.soundbuf_alt.clone()]
@@ -307,175 +349,241 @@ where
         }
     }
 
-    fn write_overlay(&mut self, addr: Address, val: Byte) -> Option<()> {
-        match addr {
-            // ROM (disables overlay)
-            0x0040_0000..=0x0057_FFFF if self.model >= MacModel::SE => {
-                self.overlay = false;
-                self.write_normal(addr, val)
-            }
-            // SCSI
-            0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.write(addr, val),
-            // RAM
-            0x0060_0000..=0x007F_FFFF => {
-                let idx = ((addr as usize) - 0x60_0000) & self.ram_mask;
-                self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
-                self.dram_touch(idx);
-                Some(self.ram[idx] = val)
-            }
-            // SCC
-            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.write(addr >> 1, val),
-            // IWM
-            0x00DF_E1FF..=0x00DF_FFFF => self.swim.write(addr, val),
-            // VIA
-            0x00EF_0000..=0x00EF_FFFF => self.via.write(addr, val),
-            _ => None,
+    /// Ends the boot overlay on an access to the normal location of the ROM
+    /// (Mac SE and later)
+    fn end_overlay(&mut self, addr: Address, write: bool) {
+        let end = if write { 0x0057_FFFF } else { 0x004F_FFFF };
+        if self.overlay && self.model >= MacModel::SE && (0x0040_0000..=end).contains(&addr) {
+            self.overlay = false;
         }
     }
 
-    fn write_normal(&mut self, addr: Address, val: Byte) -> Option<()> {
-        match addr {
-            // RAM
-            0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF => {
-                // Duplicate framebuffers to video component
-                // (writes also go through RAM)
-                if self.fb_main.contains(&(addr & self.ram_mask as Address)) {
-                    let offset = ((addr & self.ram_mask as Address) - self.fb_main.start) as usize;
-                    self.video.framebuffers[0][offset] = val;
-                }
-                if self.fb_alt.contains(&(addr & self.ram_mask as Address)) {
-                    let offset = ((addr & self.ram_mask as Address) - self.fb_alt.start) as usize;
-                    self.video.framebuffers[1][offset] = val;
-                }
+    // The 68000 transfers a byte or an even-addressed word, so both bytes of
+    // a word are in the same RAM page and framebuffer
 
-                let idx = addr as usize & self.ram_mask;
-                self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
-                self.dram_touch(idx);
-                Some(self.ram[idx] = val)
-            }
-            // SCSI
-            0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.write(addr, val),
-            // SCC
-            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.write(addr >> 1, val),
-            // IWM
-            0x00DF_E1FF..=0x00DF_FFFF => self.swim.write(addr, val),
-            // VIA
-            0x00EF_0000..=0x00EF_FFFF => {
-                self.via.write(addr, val);
-
-                Some(())
-            }
-            _ => None,
-        }
+    fn ram_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        let idx = addr as usize & self.ram_mask;
+        Some(if len == 2 {
+            u32::from(u16::from_be_bytes([self.ram[idx], self.ram[idx + 1]]))
+        } else {
+            u32::from(self.ram[idx])
+        })
     }
 
-    fn read_overlay(&mut self, addr: Address) -> Option<Byte> {
-        match addr {
-            // Overlay flip for Mac SE+
-            0x0040_0000..=0x004F_FFFF if self.model >= MacModel::SE => {
-                self.overlay = false;
-                self.read_normal(addr)
-            }
-            // ROM
-            0x0000_0000..=0x000F_FFFF | 0x0020_0000..=0x002F_FFFF | 0x0040_0000..=0x004F_FFFF => {
-                Some(
-                    *self
-                        .rom
-                        .get(addr as usize & self.rom_mask)
-                        .unwrap_or(&self.openbus[(addr & 1) as usize]),
-                )
-            }
-            // SCSI
-            0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.read(addr),
-            // RAM
-            0x0060_0000..=0x007F_FFFF => {
-                let idx = addr as usize & self.ram_mask;
-                self.dram_touch(idx);
-                Some(self.ram[idx])
-            }
-            // Phase adjust (ignore)
-            0x009F_FFF7 | 0x009F_FFF9 => Some(0),
-            // SCC
-            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.read(addr >> 1),
-            // IWM
-            0x00DF_E1FF..=0x00DF_FFFF => self.swim.read(addr),
-            // VIA
-            0x00EF_0000..=0x00EF_FFFF => self.via.read(addr),
-            // Phase read (ignore)
-            0x00F0_0000..=0x00F7_FFFF => Some(0),
-            // Test software region / extension ROM
-            0x00F8_0000..=0x00F9_FFFF => Some(
-                *self
-                    .extension_rom
-                    .get((addr - 0xF8_0000) as usize)
-                    .unwrap_or(&self.openbus[(addr & 1) as usize]),
-            ),
+    fn ram_write(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        let idx = addr as usize & self.ram_mask;
+        let bytes = &(val as u16).to_be_bytes()[2 - len as usize..];
 
-            _ => None,
+        // Duplicate framebuffers to video component
+        // (writes also go through RAM)
+        for (fb, range) in [&self.fb_main, &self.fb_alt].into_iter().enumerate() {
+            if range.contains(&(idx as Address)) {
+                let offset = idx - range.start as usize;
+                self.video.framebuffers[fb][offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
         }
+
+        self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+        self.ram[idx..idx + bytes.len()].copy_from_slice(bytes);
+        Some(())
     }
 
-    fn read_normal(&mut self, addr: Address) -> Option<Byte> {
-        match addr {
-            // RAM
-            0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF => {
-                let idx = addr as usize & self.ram_mask;
-                self.dram_touch(idx);
-                Some(self.ram[idx])
-            }
-            // ROM
-            0x0040_0000..=0x0043_FFFF => {
-                // With a One ROM fitted, the device OWNS this window: every
-                // read is a bus cycle it observes (a command byte is sent by
-                // READING an address on its command page), and the byte served
-                // comes from whichever slot it is currently serving rather
-                // than from the static image.
-                if let Some(or) = self.onerom.as_mut() {
-                    if or.covers(addr) {
-                        return Some(or.access(addr, 1));
-                    }
+    fn ram_write_overlay(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        for a in addr..addr + len {
+            let idx = ((a as usize) - 0x60_0000) & self.ram_mask;
+            self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+            self.ram[idx] = (val >> (8 * (addr + len - 1 - a))) as Byte;
+        }
+        Some(())
+    }
+
+    fn rom_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        Some((addr..addr + len).fold(0, |v, a| {
+            let open = self.openbus[(a & 1) as usize];
+            (v << 8) | u32::from(*self.rom.get(a as usize & self.rom_mask).unwrap_or(&open))
+        }))
+    }
+
+    // CPU bus cycles only: a debugger inspect is not a RAS strobe for the DRAM
+    // decay model and must not be seen by a One ROM as a command read
+
+    fn cpu_ram_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        self.dram_touch(addr as usize & self.ram_mask);
+        self.ram_read(addr, len)
+    }
+
+    fn cpu_ram_write(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        self.dram_touch(addr as usize & self.ram_mask);
+        self.ram_write(addr, len, val)
+    }
+
+    fn cpu_ram_write_overlay(&mut self, addr: Address, len: u32, val: u32) -> Option<()> {
+        self.dram_touch(((addr as usize) - 0x60_0000) & self.ram_mask);
+        self.ram_write_overlay(addr, len, val)
+    }
+
+    fn cpu_rom_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        // With a One ROM fitted, the device OWNS the $40_0000-$43_FFFF window:
+        // every read is a bus cycle it observes (a command byte is sent by
+        // READING an address on its command page), and the byte served comes
+        // from whichever slot it is currently serving rather than from the
+        // static image.
+        if !self.overlay && (0x0040_0000..=0x0043_FFFF).contains(&addr) {
+            if let Some(or) = self.onerom.as_mut() {
+                if or.covers(addr) {
+                    return Some((addr..addr + len).fold(0, |v, a| (v << 8) | u32::from(or.access(a, 1))));
                 }
-                Some(
-                    *self
-                        .rom
-                        .get(addr as usize & self.rom_mask)
-                        .unwrap_or(&self.openbus[(addr & 1) as usize]),
-                )
             }
-            0x0044_0000..=0x004F_FFFF => {
-                if self.model == MacModel::Plus {
-                    // Plus with SCSI has no repeated ROM images above 0x440000 as
-                    // indication of SCSI controller present.
-                    //
-                    // 512Ke (using Plus ROM) does have repeated ROM images
-                    Some(self.openbus[(addr & 1) as usize])
+        }
+        self.rom_read(addr, len)
+    }
+
+    fn ext_rom_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        Some((addr..addr + len).fold(0, |v, a| {
+            let open = self.openbus[(a & 1) as usize];
+            let rom = self.extension_rom.get((a - 0xF8_0000) as usize);
+            (v << 8) | u32::from(*rom.unwrap_or(&open))
+        }))
+    }
+
+    fn openbus_read(&mut self, addr: Address, len: u32) -> Option<u32> {
+        Some((addr..addr + len).fold(0, |v, a| {
+            (v << 8) | u32::from(self.openbus[(a & 1) as usize])
+        }))
+    }
+
+    fn zero_read(&mut self, _addr: Address, _len: u32) -> Option<u32> {
+        Some(0)
+    }
+
+    fn no_write(&mut self, _addr: Address, _len: u32, _val: u32) -> Option<()> {
+        None
+    }
+
+    fn scsi_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.scsi.read(addr).map(u32::from)
+    }
+
+    fn scsi_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.scsi.write(addr, val as Byte)
+    }
+
+    fn scc_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.scc.read(addr >> 1).map(u32::from)
+    }
+
+    fn scc_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.scc.write(addr >> 1, val as Byte)
+    }
+
+    /// The SCSI controller is on the upper byte lane. Its /IOR is /UDS and
+    /// its /IOW is /LDS, whatever the direction of the access.
+    fn scsi_cycle(&mut self, acc: BusAccess<Bus68000>, waits: Ticks) -> BusResponse {
+        let ior = acc.addr & 1 == 0;
+        let iow = acc.addr & 1 != 0 || acc.size == 2;
+        bus_access_byte_lane::<2, 0, _, _>(
+            acc,
+            waits,
+            self,
+            |bus, addr, _| {
+                let val = if ior {
+                    u32::from(bus.scsi.read(addr)?)
                 } else {
-                    Some(
-                        *self
-                            .rom
-                            .get(addr as usize & self.rom_mask)
-                            .unwrap_or(&self.openbus[(addr & 1) as usize]),
-                    )
+                    0xFF
+                };
+                // Latches its lane, which it drives itself on a word read
+                if iow {
+                    bus.scsi.write(addr, val as Byte)?;
                 }
-            }
-            // SCSI
-            0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.read(addr),
-            // SCC
-            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.read(addr >> 1),
-            // IWM
-            0x00DF_E1FF..=0x00DF_FFFF => self.swim.read(addr),
-            // VIA
-            0x00EF_0000..=0x00EF_FFFF => self.via.read(addr),
-            // Test software region / extension ROM
-            0x00F8_0000..=0x00F9_FFFF => Some(
-                *self
-                    .extension_rom
-                    .get((addr - 0xF8_0000) as usize)
-                    .unwrap_or(&self.openbus[(addr & 1) as usize]),
-            ),
+                Some(val)
+            },
+            |bus, addr, _, val| {
+                if ior {
+                    bus.scsi.read(addr)?;
+                }
+                if iow {
+                    bus.scsi.write(addr, val as Byte)?;
+                }
+                Some(())
+            },
+        )
+    }
 
-            _ => None,
+    /// The SCC is on the upper byte lane. Its /RD comes from the address
+    /// decode (the read range, A21=0, whatever the direction) and its /WR is
+    /// /LDS, asserted by accesses to the odd byte.
+    fn scc_cycle(&mut self, acc: BusAccess<Bus68000>, waits: Ticks) -> BusResponse {
+        let rd = acc.addr & 0x0020_0000 == 0;
+        let wr = acc.addr & 1 != 0 || acc.size == 2;
+        match (rd, wr) {
+            (true, false) => bus_access_byte_lane::<2, 0, _, _>(
+                acc,
+                waits,
+                self,
+                Self::scc_read,
+                |bus, addr, len, _| bus.scc_read(addr, len).map(|_| ()),
+            ),
+            // Latches its floating lane on a read
+            (false, true) => bus_access_byte_lane::<2, 0, _, _>(
+                acc,
+                waits,
+                self,
+                |bus, addr, len| {
+                    bus.scc_write(addr, len, 0xFF)?;
+                    Some(0xFF)
+                },
+                Self::scc_write,
+            ),
+            // Both strobes at once reset the SCC. A word access also adjusts
+            // the phase of the video timing, which is not emulated.
+            (true, true) => bus_access_byte_lane::<2, 0, _, _>(
+                acc,
+                waits,
+                self,
+                |bus, _, _| {
+                    bus.scc = Scc::new();
+                    Some(0xFF)
+                },
+                |bus, _, _, _| {
+                    bus.scc = Scc::new();
+                    Some(())
+                },
+            ),
+            (false, false) => bus_access_byte_lane::<2, 0, _, _>(
+                acc,
+                waits,
+                self,
+                |_, _, _| Some(0xFF),
+                |_, _, _, _| Some(()),
+            ),
         }
+    }
+
+    fn iwm_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.swim.read(addr).map(u32::from)
+    }
+
+    fn iwm_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.swim.write(addr, val as Byte)
+    }
+
+    fn via_read(&mut self, addr: Address, _len: u32) -> Option<u32> {
+        self.via.read(addr).map(u32::from)
+    }
+
+    fn via_write(&mut self, addr: Address, _len: u32, val: u32) -> Option<()> {
+        self.via.write(addr, val as Byte)?;
+        self.sync_via_pa();
+        Some(())
+    }
+
+    /// Syncs the devices driven by the VIA port A pins
+    fn sync_via_pa(&mut self) {
+        if self.model <= MacModel::Plus {
+            self.overlay = self.via.pa().overlay();
+        }
+        self.swim.sel = self.via.pa().sel();
+        self.video.framebuffer_select = self.via.pa().page2();
     }
 
     /// Updates the mouse position (relative coordinates) and button state
@@ -561,32 +669,40 @@ where
         self.speed = speed;
     }
 
-    /// Tests for wait states on bus access
-    fn in_waitstate(&mut self, addr: Address) -> bool {
-        // DTACK (only for RAM region)
-        if (0x0000_0000..=0x003F_FFFF).contains(&addr)
-            && !self.video.in_blanking_period()
-            && !self.model.ram_interleave_cpu(self.cycles)
-        {
-            // RAM access for CPU currently blocked by memory controller
+    /// Frequency of the bus of the real hardware, without overclocking
+    #[inline(always)]
+    pub const fn bus_frequency(&self) -> Ticks {
+        BUS_FREQUENCY
+    }
+
+    /// Sets the frequency of the bus, or goes back to the one of the real
+    /// hardware
+    pub fn set_overclock(&mut self, bus_frequency: Option<u64>) {
+        self.act_bus_frequency = bus_frequency.unwrap_or_else(|| self.bus_frequency());
+    }
+
+    /// Stall of a bus cycle which has to wait, polled every 2 cycles with
+    /// the bus ticked in between, or None once it can go on
+    fn stall(&mut self, acc: &BusAccess<Bus68000>) -> Option<Ticks> {
+        match acc.addr {
+            // RAM, while the memory controller gives it to the video.
+            // The first check is against the bus as last ticked.
             // https://www.bigmessowires.com/2011/08/25/68000-interleaved-memory-controller-design/
-            return true;
-        }
-
-        // VPA
-        if addr >= 0xE0_0000 {
-            if !self.vpa_sync {
-                // Start E-Clock synchronization, wait for next low edge.
-                self.vpa_sync = true;
-            } else if self.eclock == 0 {
-                // Low edge, synchronized
-                self.vpa_sync = false;
-                return false;
+            0x0000_0000..=0x003F_FFFF => {
+                if !self.video.in_blanking_period() && !self.model.ram_interleave_cpu(self.cycles) {
+                    return Some(2);
+                }
             }
-            return true;
+            // VPA: synchronized to the next low edge of the E clock
+            0x00E0_0000..=0x00FF_FFFF => {
+                if !self.vpa_polled || self.eclock != 0 {
+                    self.vpa_polled = true;
+                    return Some(2);
+                }
+            }
+            _ => (),
         }
-
-        false
+        None
     }
 
     /// Programmer's key pressed
@@ -661,61 +777,71 @@ impl<TRenderer> Bus<Address, Byte> for CompactMacBus<TRenderer>
 where
     TRenderer: Renderer,
 {
+    type Cpu = Bus68000;
+
     fn get_mask(&self) -> Address {
         0x00FFFFFF
     }
 
-    fn read(&mut self, addr: Address) -> BusResult<Byte> {
-        if self.in_waitstate(addr) {
-            return BusResult::WaitState;
+    #[inline(always)]
+    fn access(&mut self, acc: BusAccess<Bus68000>) -> Result<BusResponse> {
+        if let Some(stall) = self.stall(&acc) {
+            return Ok(BusResponse::Stall(stall));
         }
+        self.vpa_polled = false;
 
-        let val = if self.overlay {
-            self.read_overlay(addr)
-        } else {
-            self.read_normal(addr)
+        self.end_overlay(acc.addr, acc.write);
+        let region = self.map[usize::from(self.overlay)][(acc.addr >> MAP_BLOCK_SHIFT) as usize];
+        let resp = match region {
+            Region::Ram => bus_access_word(acc, 0, self, Self::cpu_ram_read, Self::cpu_ram_write),
+            Region::RamOverlay => {
+                bus_access_word(acc, 0, self, Self::cpu_ram_read, Self::cpu_ram_write_overlay)
+            }
+            Region::Rom => bus_access_word(acc, 0, self, Self::cpu_rom_read, Self::no_write),
+            Region::OpenBus => bus_access_word(acc, 0, self, Self::openbus_read, Self::no_write),
+            Region::Scsi => self.scsi_cycle(acc, 0),
+            Region::Scc => self.scc_cycle(acc, 0),
+            // On the lower byte lane, at odd addresses
+            Region::Iwm => {
+                bus_access_byte_lane::<2, 1, _, _>(acc, 0, self, Self::iwm_read, Self::iwm_write)
+            }
+            // On the upper byte lane, at even addresses
+            Region::Via => {
+                bus_access_byte_lane::<2, 0, _, _>(acc, 0, self, Self::via_read, Self::via_write)
+            }
+            Region::PhaseRead => bus_access_word(acc, 0, self, Self::zero_read, Self::no_write),
+            Region::ExtRom => bus_access_word(acc, 0, self, Self::ext_rom_read, Self::no_write),
+            Region::None => BusResponse::BusError,
+        };
+        let (data, waits) = match resp {
+            BusResponse::Ack { data, waits, .. } => (data, waits),
+            BusResponse::Stall(_) => unreachable!(),
+            BusResponse::BusError if acc.write => {
+                warn!(
+                    "Write to unimplemented address: {:08X} {:02X}",
+                    acc.addr, acc.data
+                );
+                (0, 0)
+            }
+            BusResponse::BusError => {
+                warn!("Read from unimplemented address: {:08X}", acc.addr);
+                (self.openbus_read(acc.addr, acc.size).unwrap_or_default(), 0)
+            }
         };
 
-        if let Some(v) = val {
-            self.openbus[(addr & 1) as usize] = v;
-            BusResult::Ok(v)
+        // The data bus keeps the last value on each lane
+        let val = if acc.write { acc.data } else { data };
+        if acc.size == 2 {
+            self.openbus = [(val >> 8) as Byte, val as Byte];
         } else {
-            warn!("Read from unimplemented address: {:08X}", addr);
-            BusResult::Ok(self.openbus[(addr & 1) as usize])
-        }
-    }
-
-    fn write(&mut self, addr: Address, val: Byte) -> BusResult<Byte> {
-        if self.in_waitstate(addr) {
-            return BusResult::WaitState;
+            self.openbus[(acc.addr & 1) as usize] = val as Byte;
         }
 
-        let written = if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_normal(addr, val)
-        };
-
-        // On the 512K/Plus, PA4 is a LIVE ROM-overlay mux: overlay is ON while
-        // PA4=1 and OFF while PA4=0, and it must follow PA4 in BOTH directions
-        // (not a one-shot disable).  Software relies on this: e.g. a diagnostic
-        // ROM's machine-type probe drives PA4=1 to check whether ROM re-maps to
-        // $0 (Plus) vs stays RAM (SE, where PA4 is drive-select), then restores
-        // PA4=0.  A one-way disable made the Plus look like an SE to that probe.
-        if self.model <= MacModel::Plus {
-            self.overlay = self.via.a_out.overlay();
-        }
-
-        // Sync values that live in multiple places
-        self.swim.sel = self.via.a_out.sel();
-        self.video.framebuffer_select = self.via.a_out.page2();
-
-        if written.is_none() {
-            warn!("Write to unimplemented address: {:08X} {:02X}", addr, val);
-        }
-
-        self.openbus[(addr & 1) as usize] = val;
-        BusResult::Ok(val)
+        Ok(BusResponse::Ack {
+            width: 2,
+            data,
+            waits,
+        })
     }
 
     fn reset(&mut self, hard: bool) -> Result<bool> {
@@ -737,10 +863,12 @@ where
         }
 
         // Keep the RTC and ADB for PRAM and event channels
-        let Via { adb, rtc, .. } = std::mem::replace(&mut self.via, Via::new(self.model));
+        let Via { adb, rtc, .. } =
+            std::mem::replace(&mut self.via, Via::new(self.model, BUS_FREQUENCY));
         self.via.adb = adb;
         self.via.rtc = rtc;
         self.overlay = true;
+        self.sync_via_pa();
         self.scc = Scc::new();
 
         // All compact Macs have RESET and HALT tied together
@@ -755,19 +883,30 @@ where
     fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
         struct BusEmuContext {
             speed: EmulatorSpeed,
+            bus_frequency: Ticks,
         }
 
         impl EmuContext for BusEmuContext {
             fn speed(&self) -> EmulatorSpeed {
                 self.speed
             }
+
+            fn bus_frequency(&self) -> Ticks {
+                self.bus_frequency
+            }
         }
 
-        let ctx = &BusEmuContext { speed: self.speed };
+        let ctx = &BusEmuContext {
+            speed: self.speed,
+            bus_frequency: self.act_bus_frequency,
+        };
 
-        // XXX: run one tick at a time to avoid missing hblanks and vblanks
-        for _ in 0..ticks {
-            let ticks = 1;
+        // Run up to the next E clock edge or blanking edge at a time, where
+        // anything below can change
+        let mut left = ticks;
+        while left > 0 {
+            let ticks = left.min(10 - self.eclock).min(self.video.cycles_to_edge());
+            left -= ticks;
 
             self.cycles += ticks;
 
@@ -782,7 +921,7 @@ where
                 // TODO ticks when VPA is asserted
                 self.eclock -= 10;
 
-                self.via.tick(1, ())?;
+                self.via.tick(1, ctx)?;
             }
 
             // Pixel clock (15.6672 MHz) is roughly 2x CPU speed
@@ -792,12 +931,12 @@ where
             if self.model <= MacModel::Plus {
                 self.via.b_in.set_h4(self.video.in_hblank());
             } else {
-                self.swim.intdrive = self.via.a_out.drivesel();
+                self.swim.intdrive = self.via.pa().drivesel();
             }
 
             // VBlank interrupt
             if self.video.get_clr_vblank() {
-                self.via.ifr.set_vblank(true);
+                self.via.set_line(ViaLine::CA1, LineState::Pulse);
 
                 // DRAM decay: apply the video scan's partial refresh (RA0..RA8
                 // only, RA9 held static) and rot any row that has gone too long
@@ -836,9 +975,7 @@ where
             if self.video.get_clr_hblank() {
                 // Update floppy drive PWM and send next audio sample
                 let scanline = self.video.get_scanline();
-                let soundon = self.via.a_out.sound() > 0
-                    && self.via.ddrb.sndenb()
-                    && !self.via.b_out.sndenb();
+                let soundon = self.via.pa().sound() > 0 && !self.via.pb().sndenb();
                 let soundbuf = self.soundbuf();
                 let pwm = soundbuf[scanline * 2 + 1];
                 let audiosample = if soundon { soundbuf[scanline * 2] } else { 0 };
@@ -889,7 +1026,7 @@ where
         // Sample VIA level-1 IRQ sources every call (before the SCC/progkey
         // early-returns can skip it) so the per-source edge count is complete.
         if crate::perf::enabled() {
-            crate::perf::via_irq_edge((self.via.ifr.0 & self.via.ier.0) & 0x7F);
+            crate::perf::via_irq_edge((self.via.ifr().0 & self.via.ier.0) & 0x7F);
         }
         // Programmer's key
         if self.progkey_pressed.get_clear() {
@@ -900,11 +1037,11 @@ where
             return Some(2);
         }
         // VIA IRQs
-        if self.via.ifr.0 & self.via.ier.0 != 0 {
+        if self.via.irq() {
             return Some(1);
         }
         // SCSI IRQs
-        if self.model >= MacModel::SE && self.scsi.get_irq() && !self.via.b_out.scsi_int() {
+        if self.model >= MacModel::SE && self.scsi.get_irq() && !self.via.pb().scsi_int() {
             return Some(1);
         }
 
@@ -919,24 +1056,108 @@ where
     fn inspect_read(&mut self, addr: Address) -> Option<Byte> {
         // Everything up to 0x800000 is safe (RAM/ROM only)
         if addr >= 0x80_0000 {
-            None
-        } else if self.overlay {
-            self.read_overlay(addr)
-        } else {
-            self.read_normal(addr)
+            return None;
         }
+        self.end_overlay(addr, false);
+        let val = match self.map[usize::from(self.overlay)][(addr >> MAP_BLOCK_SHIFT) as usize] {
+            Region::Ram | Region::RamOverlay => self.ram_read(addr, 1),
+            Region::Rom => self.rom_read(addr, 1),
+            Region::OpenBus => self.openbus_read(addr, 1),
+            Region::Scsi => self.scsi_read(addr, 1),
+            _ => None,
+        };
+        val.map(|v| v as Byte)
     }
 
     fn inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> {
         // Everything up to 0x800000 is safe (RAM/ROM only)
         if addr >= 0x80_0000 {
-            None
-        } else if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_normal(addr, val)
+            return None;
+        }
+        self.end_overlay(addr, true);
+        let val = val.into();
+        match self.map[usize::from(self.overlay)][(addr >> MAP_BLOCK_SHIFT) as usize] {
+            Region::Ram => self.ram_write(addr, 1, val),
+            Region::RamOverlay => self.ram_write_overlay(addr, 1, val),
+            Region::Scsi => self.scsi_write(addr, 1, val),
+            _ => None,
         }
     }
+}
+
+/// Region at `addr`
+fn region(model: MacModel, overlay: bool, addr: Address) -> Region {
+    if model >= MacModel::SE {
+        region_se(model, overlay, addr)
+    } else {
+        region_plus(model, overlay, addr)
+    }
+}
+
+/// 128K, 512K, 512Ke and Plus: the devices are selected from A23-A19 only
+/// (BMU1 PAL) and appear all over their block
+fn region_plus(model: MacModel, overlay: bool, addr: Address) -> Region {
+    match addr {
+        0x0000_0000..=0x003F_FFFF if !overlay => Region::Ram,
+        // ROM in place of the RAM during the boot overlay
+        0x0000_0000..=0x000F_FFFF | 0x0020_0000..=0x002F_FFFF => Region::Rom,
+        0x0040_0000..=0x0043_FFFF => Region::Rom,
+        // Plus with SCSI has no repeated ROM images above 0x440000 as
+        // indication of SCSI controller present.
+        //
+        // 512Ke (using Plus ROM) does have repeated ROM images
+        0x0044_0000..=0x004F_FFFF if model == MacModel::Plus && !overlay => Region::OpenBus,
+        0x0044_0000..=0x004F_FFFF => Region::Rom,
+        0x0058_0000..=0x005F_FFFF if model.has_scsi() => Region::Scsi,
+        0x0060_0000..=0x006F_FFFF if !overlay => Region::Ram,
+        0x0060_0000..=0x007F_FFFF if overlay => Region::RamOverlay,
+        // Read at $800000-$9FFFFF, write at $A00000-$BFFFFF
+        0x0080_0000..=0x00BF_FFFF => Region::Scc,
+        0x00C0_0000..=0x00DF_FFFF => Region::Iwm,
+        0x00E8_0000..=0x00EF_FFFF => Region::Via,
+        // The VIA (A20=0) and the phase read (A19=0) are both selected at
+        // $E00000-$E7FFFF, which Apple says not to use: give it to the
+        // phase read
+        0x00E0_0000..=0x00E7_FFFF | 0x00F0_0000..=0x00F7_FFFF => Region::PhaseRead,
+        0x00F8_0000..=0x00F9_FFFF => Region::ExtRom,
+        _ => Region::None,
+    }
+}
+
+/// SE and Classic, as Apple documented them (Tech Info Library 8295). The
+/// BBU decodes more address lines and leaves everything else floating.
+fn region_se(model: MacModel, overlay: bool, addr: Address) -> Region {
+    match addr {
+        0x0000_0000..=0x003F_FFFF if !overlay => Region::Ram,
+        // ROM in place of the RAM during the boot overlay
+        0x0000_0000..=0x000F_FFFF | 0x0020_0000..=0x002F_FFFF => Region::Rom,
+        0x0040_0000..=0x0043_FFFF => Region::Rom,
+        // The Classic ROM is 512KB, with a ROM disk in its upper half
+        0x0044_0000..=0x0047_FFFF if model == MacModel::Classic => Region::Rom,
+        0x0058_0000..=0x005F_FFFF => Region::Scsi,
+        0x0060_0000..=0x007F_FFFF if overlay => Region::RamOverlay,
+        // Read at $900000-$9FFFFF, write at $B00000-$BFFFFF
+        0x0090_0000..=0x009F_FFFF | 0x00B0_0000..=0x00BF_FFFF => Region::Scc,
+        // $AA0000-$AFFFFF selects the expansion slot (PDS), which has
+        // nothing in it
+        0x00D0_0000..=0x00DF_FFFF => Region::Iwm,
+        0x00E8_0000..=0x00EF_FFFF => Region::Via,
+        // Not in the real map
+        0x00F8_0000..=0x00F9_FFFF => Region::ExtRom,
+        _ => Region::None,
+    }
+}
+
+fn build_map(model: MacModel) -> AddressMap {
+    std::array::from_fn(|overlay| {
+        std::array::from_fn(|block| {
+            region(model, overlay == 1, (block as Address) << MAP_BLOCK_SHIFT)
+        })
+    })
+}
+
+fn empty_map() -> AddressMap {
+    [[Region::None; MAP_BLOCKS]; 2]
 }
 
 impl<TRenderer> Debuggable for CompactMacBus<TRenderer>

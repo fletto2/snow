@@ -1,8 +1,9 @@
 use anyhow::Result;
 use num_traits::{PrimInt, WrappingAdd};
 
-use super::{Bus, IrqSource};
-use crate::bus::BusResult;
+use super::access::CpuBus;
+use super::{Address, Bus, IrqSource};
+use crate::bus::access::{BusAccess, BusResponse};
 use crate::tickable::{Tickable, Ticks};
 
 use std::cell::RefCell;
@@ -10,6 +11,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::marker::PhantomData;
+use std::ops::RangeInclusive;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Access {
@@ -25,7 +28,8 @@ pub struct TraceEntry<TA: PrimInt + WrappingAdd, TD: PrimInt> {
     pub cpu_cycle: Ticks,
 }
 
-pub struct Testbus<TA: PrimInt + WrappingAdd + Hash + Debug, TD: PrimInt> {
+/// Test bus for a CPU with the data bus `C`
+pub struct Testbus<TA: PrimInt + WrappingAdd + Hash + Debug, TD: PrimInt, C> {
     pub mem: HashMap<TA, TD>,
     trace: RefCell<Vec<TraceEntry<TA, TD>>>,
     bus_cycles: Ticks,
@@ -33,9 +37,12 @@ pub struct Testbus<TA: PrimInt + WrappingAdd + Hash + Debug, TD: PrimInt> {
     trace_enabled: bool,
     mask: TA,
     pub irq_level: Option<u8>,
+    _cpu: PhantomData<C>,
+    /// Port widths for sized accesses, the CPU's data bus width elsewhere
+    pub port_widths: Vec<(RangeInclusive<Address>, u32)>,
 }
 
-impl<TA, TD> Testbus<TA, TD>
+impl<TA, TD, C> Testbus<TA, TD, C>
 where
     TA: PrimInt + WrappingAdd + Hash + Debug,
     TD: PrimInt,
@@ -49,6 +56,8 @@ where
             trace_enabled: false,
             mask,
             irq_level: None,
+            _cpu: PhantomData,
+            port_widths: vec![],
         }
     }
 
@@ -64,18 +73,8 @@ where
     pub fn get_trace(&self) -> Vec<TraceEntry<TA, TD>> {
         self.trace.borrow().clone()
     }
-}
 
-impl<TA, TD> Bus<TA, TD> for Testbus<TA, TD>
-where
-    TA: PrimInt + WrappingAdd + Hash + Debug,
-    TD: PrimInt,
-{
-    fn get_mask(&self) -> TA {
-        self.mask
-    }
-
-    fn read(&mut self, addr: TA) -> BusResult<TD> {
+    pub fn read(&mut self, addr: TA) -> TD {
         assert_eq!(addr & self.mask, addr);
 
         #[allow(clippy::or_fun_call)]
@@ -89,10 +88,10 @@ where
                 cpu_cycle: self.cpu_cycles,
             });
         }
-        BusResult::Ok(val)
+        val
     }
 
-    fn write(&mut self, addr: TA, val: TD) -> BusResult<TD> {
+    pub fn write(&mut self, addr: TA, val: TD) {
         assert_eq!(addr & self.mask, addr);
 
         if self.trace_enabled {
@@ -104,7 +103,43 @@ where
             });
         }
         self.mem.insert(addr, val);
-        BusResult::Ok(val)
+    }
+}
+
+impl<TA, TD, C: CpuBus> Bus<TA, TD> for Testbus<TA, TD, C>
+where
+    TA: PrimInt + WrappingAdd + Hash + Debug,
+    TD: PrimInt,
+{
+    type Cpu = C;
+
+    fn get_mask(&self) -> TA {
+        self.mask
+    }
+
+    fn access(&mut self, acc: BusAccess<C>) -> Result<BusResponse> {
+        let width = self
+            .port_widths
+            .iter()
+            .find(|(r, _)| r.contains(&acc.addr))
+            .map_or(C::WIDTH, |&(_, w)| w);
+        let len = (width - acc.addr % width).min(acc.size);
+        let mut data = 0;
+        for i in 0..len {
+            let addr = TA::from(acc.addr.wrapping_add(i)).unwrap();
+            if acc.write {
+                let val = TD::from((acc.data >> (8 * (acc.size - 1 - i))) & 0xFF).unwrap();
+                self.write(addr, val);
+            } else {
+                let val = self.read(addr);
+                data = (data << 8) | val.to_u32().unwrap();
+            }
+        }
+        Ok(BusResponse::Ack {
+            width,
+            data,
+            waits: 0,
+        })
     }
 
     fn reset(&mut self, _hard: bool) -> Result<bool> {
@@ -117,7 +152,7 @@ where
     }
 }
 
-impl<TA, TD> Tickable for Testbus<TA, TD>
+impl<TA, TD, C: CpuBus> Tickable for Testbus<TA, TD, C>
 where
     TA: PrimInt + WrappingAdd + Hash + Debug,
     TD: PrimInt,
@@ -128,7 +163,7 @@ where
     }
 }
 
-impl<TA, TD> IrqSource for Testbus<TA, TD>
+impl<TA, TD, C: CpuBus> IrqSource for Testbus<TA, TD, C>
 where
     TA: PrimInt + WrappingAdd + Hash + Debug,
     TD: PrimInt,
@@ -138,7 +173,7 @@ where
     }
 }
 
-impl<TA, TD> fmt::Display for Testbus<TA, TD>
+impl<TA, TD, C> fmt::Display for Testbus<TA, TD, C>
 where
     TA: PrimInt + WrappingAdd + Hash + Debug,
     TD: PrimInt,
@@ -151,34 +186,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::access::Bus68000;
 
     #[test]
     fn testbus() {
-        let mut b = Testbus::<u16, u8>::new(u16::MAX);
+        let mut b = Testbus::<u16, u8, Bus68000>::new(u16::MAX);
 
         for a in 0..=u16::MAX {
-            assert_eq!(b.read(a), BusResult::Ok(0));
+            assert_eq!(b.read(a), 0);
         }
         for a in 0..=u16::MAX {
-            assert_eq!(b.write(a, a as u8), BusResult::Ok(a as u8));
+            b.write(a, a as u8);
         }
         for a in 0..=u16::MAX {
-            assert_eq!(b.read(a), BusResult::Ok(a as u8));
+            assert_eq!(b.read(a), a as u8);
         }
     }
 
     #[test]
     fn in_mask() {
-        let mut b = Testbus::<u16, u8>::new(u8::MAX.into());
+        let mut b = Testbus::<u16, u8, Bus68000>::new(u8::MAX.into());
 
-        assert_eq!(b.write(0x10, 1), BusResult::Ok(1));
+        b.write(0x10, 1);
     }
 
     #[test]
     #[should_panic]
     fn out_mask() {
-        let mut b = Testbus::<u16, u8>::new(u8::MAX.into());
+        let mut b = Testbus::<u16, u8, Bus68000>::new(u8::MAX.into());
 
-        let _ = b.write(0x100, 1);
+        b.write(0x100, 1);
     }
 }

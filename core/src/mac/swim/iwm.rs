@@ -102,11 +102,15 @@ impl Swim {
             5 => self.ca2 = true,
             6 => self.lstrb = false,
             7 => {
-                self.lstrb = true;
+                // The drive latches its control register on the rising edge of LSTRB,
+                // so touching LSTRBH while it is already high does nothing
+                if !self.lstrb {
+                    self.lstrb = true;
 
-                let reg = self.get_selected_drive_reg_u8();
-                let cycles = self.cycles;
-                self.get_selected_drive_mut().write_drive_reg(reg, cycles);
+                    let reg = self.get_selected_drive_reg_u8();
+                    let cycles = self.cycles;
+                    self.get_selected_drive_mut().write_drive_reg(reg, cycles);
+                }
             }
             8 => {
                 self.enable = false;
@@ -256,7 +260,7 @@ impl Swim {
             // This is sometimes called 'weak bits'. Some copy protection schemes rely on
             // this phenomenon.
             self.iwm_zeroes += 1;
-            if self.iwm_zeroes > 3 && rand::rng().random() {
+            if self.iwm_zeroes > 4 && rand::rng().random() {
                 self.shdata |= 1;
             }
         }
@@ -273,50 +277,25 @@ impl Swim {
     fn iwm_tick_flux(&mut self, ticks: Ticks) -> Result<()> {
         let side = self.get_active_head();
         let track = self.get_selected_drive().get_active_track();
-        self.get_selected_drive_mut().flux_ticks_left -= ticks as i16;
 
-        // Not sure how long this should be?
-        if self.get_selected_drive().flux_ticks_left < self.get_selected_drive().flux_ticks - 20 {
-            self.get_selected_drive_mut().head_bit[side] = false;
-        }
+        // Run up to each flux transition within the ticks in turn
+        let mut left = ticks;
+        while left > 0 {
+            // A transition is at least one tick away
+            let to_flux = self.get_selected_drive().flux_ticks_left.max(1) as Ticks;
+            let step = left.min(to_flux);
+            left -= step;
+            self.get_selected_drive_mut().flux_ticks_left -= step as i16;
 
-        if self.get_selected_drive().flux_ticks_left <= 0 {
-            // Flux transition occured
-
-            // Introduce some pseudo-random jitter on the timing to emulate
-            // the minor differences introduced by motor RPM instability and
-            // physical movement of the disk donut.
-            let jitter = -3 + (self.cycles % 6) as i16;
-
-            // Check bit cell window
-            // TODO incorporate actual drive speed from PWM on 128K/512K?
-            if let Some(time) = FluxTransitionTime::from_ticks_ex(
-                self.get_selected_drive().flux_ticks + jitter,
-                self.iwm_mode.fast(),
-                self.iwm_mode.speed(),
-            ) {
-                // Transition occured within the window, shift bits into the
-                // IWM shift register.
-                for _ in 0..(time.get_zeroes()) {
-                    self.iwm_shift_bit(false);
-                }
-                self.iwm_shift_bit(true);
-                self.get_selected_drive_mut().head_bit[side] = true;
+            // Not sure how long this should be?
+            if self.get_selected_drive().flux_ticks_left < self.get_selected_drive().flux_ticks - 20
+            {
+                self.get_selected_drive_mut().head_bit[side] = false;
             }
 
-            // Advance image to the next transition
-            let TrackLength::Transitions(tlen) =
-                self.get_selected_drive().get_track_len(side, track)
-            else {
-                unreachable!()
-            };
-            self.get_selected_drive_mut().track_position =
-                (self.get_selected_drive().track_position + 1) % tlen;
-            self.get_selected_drive_mut().flux_ticks = self
-                .get_selected_drive()
-                .floppy
-                .get_track_transition(side, track, self.get_selected_drive().track_position);
-            self.get_selected_drive_mut().flux_ticks_left = self.get_selected_drive().flux_ticks;
+            if self.get_selected_drive().flux_ticks_left <= 0 {
+                self.iwm_flux_transition(side, track, self.cycles - left);
+            }
         }
 
         if self.write_pos == 0 && self.write_buffer.is_some() {
@@ -328,14 +307,54 @@ impl Swim {
         Ok(())
     }
 
-    fn iwm_tick_bitstream(&mut self, ticks: Ticks) -> Result<()> {
-        self.bit_cycles += ticks;
-        if self.bit_cycles < self.get_selected_drive().get_ticks_per_bit() {
-            return Ok(());
+    /// Handles a flux transition passing under the head at `cycles`
+    fn iwm_flux_transition(&mut self, side: usize, track: usize, cycles: Ticks) {
+        // Introduce some pseudo-random jitter on the timing to emulate
+        // the minor differences introduced by motor RPM instability and
+        // physical movement of the disk donut.
+        let jitter = -3 + (cycles % 6) as i16;
+
+        // Check bit cell window
+        // TODO incorporate actual drive speed from PWM on 128K/512K?
+        if let Some(time) = FluxTransitionTime::from_ticks_ex(
+            self.get_selected_drive().flux_ticks + jitter,
+            self.iwm_mode.fast(),
+            self.iwm_mode.speed(),
+        ) {
+            // Transition occured within the window, shift bits into the
+            // IWM shift register.
+            for _ in 0..(time.get_zeroes()) {
+                self.iwm_shift_bit(false);
+            }
+            self.iwm_shift_bit(true);
+            self.get_selected_drive_mut().head_bit[side] = true;
         }
 
-        self.bit_cycles -= self.get_selected_drive().get_ticks_per_bit();
+        // Advance image to the next transition
+        let TrackLength::Transitions(tlen) = self.get_selected_drive().get_track_len(side, track)
+        else {
+            unreachable!()
+        };
+        self.get_selected_drive_mut().track_position =
+            (self.get_selected_drive().track_position + 1) % tlen;
+        self.get_selected_drive_mut().flux_ticks = self
+            .get_selected_drive()
+            .floppy
+            .get_track_transition(side, track, self.get_selected_drive().track_position);
+        self.get_selected_drive_mut().flux_ticks_left = self.get_selected_drive().flux_ticks;
+    }
 
+    fn iwm_tick_bitstream(&mut self, ticks: Ticks) -> Result<()> {
+        self.bit_cycles += ticks;
+        while self.bit_cycles >= self.get_selected_drive().get_ticks_per_bit() {
+            self.bit_cycles -= self.get_selected_drive().get_ticks_per_bit();
+            self.iwm_tick_bit()?;
+        }
+        Ok(())
+    }
+
+    /// Moves the head over one bit cell
+    fn iwm_tick_bit(&mut self) -> Result<()> {
         let head = self.get_active_head();
 
         // Progress the head over the track
@@ -371,5 +390,42 @@ impl Swim {
             TrackType::Bitstream => self.iwm_tick_bitstream(ticks),
             TrackType::Flux => self.iwm_tick_flux(ticks),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::BusMember;
+    use crate::mac::swim::drive::DriveType;
+
+    const CA0L: Address = 0 << 9;
+    const CA0H: Address = 1 << 9;
+    const LSTRBL: Address = 6 << 9;
+    const LSTRBH: Address = 7 << 9;
+    const ENABLE: Address = 9 << 9;
+
+    #[test]
+    fn lstrb_writes_on_rising_edge_only() {
+        let mut swim = Swim::new(&[DriveType::GCR800K], false, 16_000_000);
+        swim.read(ENABLE);
+        let start = swim.drives[0].track;
+
+        // TRACKUP (all lines low), then TRACKSTEP (CA0 high) with LSTRBH accessed
+        // five times: one rising edge, one step
+        swim.read(CA0L);
+        swim.read(LSTRBH);
+        swim.read(LSTRBL);
+        swim.read(CA0H);
+        for _ in 0..5 {
+            swim.read(LSTRBH);
+        }
+        swim.read(LSTRBL);
+        assert_eq!(swim.drives[0].track, start + 1);
+
+        // A new pulse steps again
+        swim.read(LSTRBH);
+        swim.read(LSTRBL);
+        assert_eq!(swim.drives[0].track, start + 2);
     }
 }

@@ -3,8 +3,10 @@ use std::fmt::Display;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::NubusSlot;
 use crate::bus::{Address, BusMember};
 use crate::debuggable::Debuggable;
+use crate::emulator::EmuContext;
 use crate::renderer::{DisplayBuffer, Renderer};
 use crate::tickable::{Tickable, Ticks};
 use crate::types::LatchingEvent;
@@ -39,6 +41,7 @@ pub struct Toby<TRenderer: Renderer> {
     vblank_irq: bool,
     vblank_enable: bool,
     vblank_ticks: Ticks,
+    in_vblank: bool,
 
     pub render: LatchingEvent,
 }
@@ -56,9 +59,6 @@ where
     /// Default framebuffer base offset
     const FB_BASE: usize = 0x20;
 
-    /// Ticks per frame at ~60 Hz
-    const FRAME_TICKS: Ticks = 16_000_000 / 60;
-
     pub fn new(rom: &[u8], renderer: TRenderer) -> Self {
         Self {
             renderer: Some(renderer),
@@ -72,17 +72,9 @@ where
             vblank_irq: false,
             vblank_enable: false,
             vblank_ticks: 0,
+            in_vblank: false,
             render: LatchingEvent::default(),
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.vblank_irq = false;
-        self.vblank_enable = false;
-    }
-
-    pub fn get_irq(&self) -> bool {
-        self.vblank_irq
     }
 
     pub fn bpp(&self) -> u8 {
@@ -148,20 +140,38 @@ where
             }
         }
     }
+}
 
-    pub fn blank(&mut self) -> Result<()> {
+impl<TRenderer> NubusSlot<TRenderer> for Toby<TRenderer>
+where
+    TRenderer: Renderer,
+{
+    fn reset(&mut self) {
+        self.vblank_irq = false;
+        self.vblank_enable = false;
+    }
+
+    fn get_irq(&self) -> bool {
+        self.vblank_irq
+    }
+
+    fn blank(&mut self) -> Result<()> {
         self.vram.fill(0xFF);
         self.render()?;
         Ok(())
     }
 
-    pub fn render(&mut self) -> Result<()> {
+    fn render(&mut self) -> Result<()> {
         // We have to move the renderer so we don't upset the borrow checker.
         let mut renderer = self.renderer.take().unwrap();
         self.render_to(renderer.buffer_mut());
         self.renderer = Some(renderer);
         self.renderer.as_mut().unwrap().update()?;
         Ok(())
+    }
+
+    fn set_renderer(&mut self, renderer: TRenderer) {
+        self.renderer = Some(renderer);
     }
 }
 
@@ -177,10 +187,7 @@ where
             0x0_0000..=0x7_FFFF => Some(!self.vram[a as usize]),
 
             // VBlank status: 0 during vertical blanking, 0xFF otherwise.
-            0xD_0000..=0xD_FFFF if a & 3 == 3 => {
-                let in_vblank = self.vblank_ticks >= Self::FRAME_TICKS * 480 / 525;
-                Some(if in_vblank { 0x00 } else { 0xFF })
-            }
+            0xD_0000..=0xD_FFFF if a & 3 == 3 => Some(if self.in_vblank { 0x00 } else { 0xFF }),
             0xD_0000..=0xD_FFFF => Some(0),
 
             // Declaration ROM (single byte lane, at the top of the slot space)
@@ -207,11 +214,9 @@ where
 
             // CRTC/timing registers. Written 32-bits, inverted
             0x8_0000..=0x8_FFFF => {
-                if a & 3 == 3 {
-                    let reg = ((a >> 2) & 0xF) as usize;
-                    if reg == 0xF {
-                        self.mode = (!val >> 4) & 3;
-                    }
+                let reg = ((a >> 2) & 0xF) as usize;
+                if reg == 0xF {
+                    self.mode = (!val >> 4) & 3;
                 }
                 Some(())
             }
@@ -257,19 +262,22 @@ where
     }
 }
 
-impl<TRenderer> Tickable for Toby<TRenderer>
+impl<TRenderer> Tickable<&dyn EmuContext> for Toby<TRenderer>
 where
     TRenderer: Renderer,
 {
-    fn tick(&mut self, ticks: Ticks, _: ()) -> Result<Ticks> {
+    fn tick(&mut self, ticks: Ticks, ctx: &dyn EmuContext) -> Result<Ticks> {
         self.vblank_ticks += ticks;
-        if self.vblank_ticks >= Self::FRAME_TICKS {
-            self.render()?;
-            self.vblank_ticks -= Self::FRAME_TICKS;
+        if self.vblank_ticks >= ctx.bus_frequency() / 60 {
+            if self.renderer.as_ref().unwrap().frame_wanted() {
+                self.render()?;
+            }
+            self.vblank_ticks -= ctx.bus_frequency() / 60;
             if self.vblank_enable {
                 self.vblank_irq = true;
             }
         }
+        self.in_vblank = self.vblank_ticks >= ctx.bus_frequency() / 60 * 480 / 525;
         Ok(ticks)
     }
 }

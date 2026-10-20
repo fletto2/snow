@@ -17,14 +17,20 @@ pub const STATUS_CHECK_CONDITION: u8 = 2;
 pub const CC_KEY_NOT_READY: u8 = 0x02;
 pub const CC_KEY_MEDIUM_ERROR: u8 = 0x03;
 pub const CC_KEY_ILLEGAL_REQUEST: u8 = 0x05;
+pub const CC_KEY_UNIT_ATTENTION: u8 = 0x06;
 
 pub const ASC_UNRECOVERED_READ_ERROR: u16 = 0x1100;
 pub const ASC_PARAMETER_LIST_LENGTH_ERROR: u16 = 0x1A00;
 pub const ASC_INVALID_COMMAND: u16 = 0x2000;
 pub const ASC_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE: u16 = 0x2100;
 pub const ASC_INVALID_FIELD_IN_CDB: u16 = 0x2400;
+/// NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED (used to signal a CD swap)
+pub const ASC_NOT_READY_TO_READY_CHANGE: u16 = 0x2800;
 pub const ASC_MEDIUM_NOT_PRESENT: u16 = 0x3A00;
 pub const ASC_ILLEGAL_MODE_FOR_THIS_TRACK: u16 = 0x6400;
+/// Toolbox vendor-specific: too many files to list. `OPEN_RETRO_SCSI_TOO_MANY_FILES`
+/// in BlueSCSI_Toolbox.h, set as a bare ASCQ, so ASC stays 0x00.
+pub const ASC_TOO_MANY_FILES: u16 = 0x0001;
 
 const fn scsi_cmd_len(cmdnum: u8) -> Option<usize> {
     match cmdnum {
@@ -87,8 +93,8 @@ const fn scsi_cmd_len(cmdnum: u8) -> Option<usize> {
         | 0x5A
         // AUDIO SCAN (1)
         | 0xCD
-        // BlueSCSI Toolbox commands
-        | 0xD0..=0xD9
+        // BlueSCSI Toolbox commands (0xD0-0xD9 file/metadata + 0xDA COUNT_CDS)
+        | 0xD0..=0xDA
         => Some(10),
         // REPORT KEY
         0xA4

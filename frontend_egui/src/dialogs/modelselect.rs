@@ -19,6 +19,16 @@ const SELECTABLE_VIDEO_CARDS: &[NubusDeviceKind] = &[NubusDeviceKind::Mdc12, Nub
 /// Video cards that support a user-selectable monitor.
 const VIDEO_CARDS_WITH_MONITOR: &[NubusDeviceKind] = &[NubusDeviceKind::Mdc12];
 
+/// Returns the card a display ROM belongs to, which is the onboard video for
+/// the SE/30 and the selected video card for the other models.
+pub fn video_rom_card(model: MacModel, video_card: NubusDeviceKind) -> NubusDeviceKind {
+    if model == MacModel::SE30 {
+        NubusDeviceKind::SE30Video
+    } else {
+        video_card
+    }
+}
+
 /// Dialog for selecting Macintosh model and associated ROMs
 pub struct ModelSelectionDialog {
     open: bool,
@@ -52,6 +62,9 @@ pub struct ModelSelectionDialog {
     // Extension ROM path
     extension_rom_path: String,
     extension_rom_dialog: SnowFileDialog,
+
+    // Overclock (only takes effect if overclock is checked and value is valid)
+    overclock_text: String,
 
     // Result
     result: Option<ModelSelectionResult>,
@@ -122,6 +135,8 @@ impl Default for ModelSelectionDialog {
                 .add_filter("ROM files", &["rom", "bin"])
                 .opening_mode(egui_file_dialog::OpeningMode::LastVisitedDir),
 
+            overclock_text: "40".into(),
+
             result: None,
             disable_rom_validation: false,
             main_rom_error: String::new(),
@@ -176,7 +191,7 @@ impl ModelSelectionDialog {
         if let Some(p) = display_rom_path {
             self.display_rom_path = p.to_string_lossy().to_string();
             self.card_rom_paths
-                .insert(self.selected_video_card, self.display_rom_path.clone());
+                .insert(self.rom_card(), self.display_rom_path.clone());
         }
         self.pram_enabled = pram_path.is_some();
         self.pram_path = pram_path
@@ -212,11 +227,16 @@ impl ModelSelectionDialog {
         }
         self.display_rom_path = self
             .card_rom_paths
-            .get(&self.selected_video_card)
+            .get(&self.rom_card())
             .cloned()
             .unwrap_or_default();
 
         self.do_validate_roms();
+    }
+
+    /// The card the display ROM of the selected model belongs to
+    fn rom_card(&self) -> NubusDeviceKind {
+        video_rom_card(self.selected_model, self.selected_video_card)
     }
 
     /// Called when the selected video card changes
@@ -632,6 +652,21 @@ impl ModelSelectionDialog {
                             &mut self.init_args.start_fastforward,
                             "Start in fast-forward mode",
                         );
+                        let mut overclock_enable = self.init_args.overclock.is_some();
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut overclock_enable, "Overclock:");
+                            ui.text_edit_singleline(&mut self.overclock_text);
+                            ui.label("MHz");
+                        });
+                        if overclock_enable
+                            && let Ok(overclock_value) = self.overclock_text.parse::<f64>()
+                            && let overclock_mhz = (overclock_value * 1_000_000.0) as u64
+                            && overclock_mhz > 0
+                        {
+                            self.init_args.overclock = Some(overclock_mhz);
+                        } else {
+                            self.init_args.overclock = None;
+                        }
                         if self.selected_model == MacModel::SE30 {
                             let mut x = false;
                             ui.checkbox(&mut x, "Emulate exploded PRAM battery");

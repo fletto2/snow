@@ -203,6 +203,7 @@ dispatch! {
 
     mutable_calls {
         fn set_speed(&mut self, speed: EmulatorSpeed) -> () { bus.set_speed(speed) }
+        fn set_overclock(&mut self, bus_frequency: Option<u64>) -> () { bus.set_overclock(bus_frequency) }
         fn set_audio_provider(&mut self, provider: &mut dyn AudioProvider) -> Result<()> { bus.set_audio_provider(provider) }
 
         fn cpu_tick(&mut self, ticks: Ticks) -> Result<Ticks> { tick(ticks, ()) }
@@ -220,7 +221,6 @@ dispatch! {
 
         fn bus_reset(&mut self) -> Result<bool> { bus.reset(true) }
         fn after_deserialize(&mut self, renderer: ChannelRenderer) -> () { bus.after_deserialize(renderer) }
-        fn bus_write(&mut self, addr: Address, val: Byte) -> crate::bus::BusResult<Byte> { bus.write(addr, val) }
         fn bus_inspect_read(&mut self, addr: Address) -> Option<Byte> { bus.inspect_read(addr) }
         fn bus_inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> { bus.inspect_write(addr, val) }
 
@@ -239,6 +239,7 @@ dispatch! {
 /// An interface that allows sub-components to access emulator state (such as the speed setting)
 pub trait EmuContext {
     fn speed(&self) -> EmulatorSpeed;
+    fn bus_frequency(&self) -> Ticks;
 }
 
 /// Emulator runner
@@ -651,6 +652,11 @@ impl Emulator {
                                 .scsi()
                                 .get_disk_imagefn(i)
                                 .map(|p| p.to_path_buf()),
+                            cdrom_folder: self
+                                .config
+                                .scsi()
+                                .get_cdrom_folder(i)
+                                .map(|p| p.to_path_buf()),
                             #[cfg(feature = "ethernet")]
                             link_type: self.config.scsi().targets[i]
                                 .as_ref()
@@ -873,10 +879,14 @@ impl Emulator {
         if let Err(e) = self.step() {
             self.run = false;
             self.user_error(&format!(
-                "Emulator halted: Uncaught CPU stepping error at PC {:08X}: {:?}",
+                "Emulator halted: Uncaught CPU stepping error at PC {:08X}\nSee log for details",
+                self.config.cpu_regs().pc,
+            ));
+            log::error!(
+                "Emulator halted: Uncaught CPU stepping error at PC {:08X}: {}",
                 self.config.cpu_regs().pc,
                 e
-            ));
+            );
             let _ = self.status_update();
         }
     }
@@ -891,6 +901,17 @@ impl Emulator {
         let audio_provider = audio_provider.as_deref_mut().map(|ap| &mut *ap);
         self.config.scsi_mut().attach_cdrom_at(id, audio_provider);
         info!("SCSI ID #{}: CD-ROM drive attached", id);
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn attach_cdrom_folder(&mut self, id: usize, dir: PathBuf) -> Result<()> {
+        let mut audio_provider = self.audio_provider.as_deref().map(|ap| ap.lock().unwrap());
+        let audio_provider = audio_provider.as_deref_mut().map(|ap| &mut *ap);
+        self.config
+            .scsi_mut()
+            .attach_cdrom_folder_at(id, dir, audio_provider)?;
+        info!("SCSI ID #{}: Toolbox managed CD-ROM folder attached", id);
+        Ok(())
     }
 
     #[cfg(feature = "ethernet")]
@@ -1064,6 +1085,12 @@ impl Tickable for Emulator {
                         self.attach_cdrom(id);
                         self.status_update()?;
                     }
+                    EmulatorCommand::ScsiAttachCdromFolder(id, dir) => {
+                        if let Err(e) = self.attach_cdrom_folder(id, dir) {
+                            self.user_error(&format!("SCSI ID #{}: {:#}", id, e));
+                        }
+                        self.status_update()?;
+                    }
                     #[cfg(feature = "ethernet")]
                     EmulatorCommand::ScsiAttachEthernet(id) => {
                         self.attach_ethernet(id);
@@ -1193,6 +1220,9 @@ impl Tickable for Emulator {
                     }
                     EmulatorCommand::CpuSetPC(val) => self.config.cpu_set_pc(val)?,
                     EmulatorCommand::SetSpeed(s) => self.config.set_speed(s),
+                    EmulatorCommand::SetOverclock(overclock) => {
+                        self.config.set_overclock(overclock);
+                    }
                     EmulatorCommand::ProgKey => self.config.progkey(),
                     EmulatorCommand::WriteRegister(reg, val) => {
                         match reg {
